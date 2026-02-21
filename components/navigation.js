@@ -18,14 +18,14 @@ const Navigation = (props) => {
             <div className="navigation-desktop-menu">
               <ul className="navigation-links-list">
                 <li className="navigation-link-item">
-                  <a href="Homepage">
+                  <a href="community">
                     <div className="navigation-link">
                       <span>Community</span>
                     </div>
                   </a>
                 </li>
                 <li className="navigation-link-item">
-                  <a href="Homepage">
+                  <a href="AI_Tools">
                     <div className="navigation-link">
                       <span>AI Pro</span>
                     </div>
@@ -309,4 +309,5 @@ Navigation.propTypes = {
 }
 
 export default Navigation
+
 
