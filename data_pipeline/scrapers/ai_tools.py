@@ -139,7 +139,7 @@ class AIToolsScraper:
     def save_ai_tools(self, tools: List[Dict]):
         logger.info("Saving AI tools to Firestore...")
 
-        collection = db.collection("ai_tools")
+        collection = db.collection("ai_pro")
 
         for tool in tools:
             # Safe Firestore document ID
@@ -157,7 +157,7 @@ class AIToolsScraper:
 
         self.items = all_items
 
-        self.save_ai_pro_sources(all_items)
+        self.save_ai_pro(all_items)
 
         return all_items
 
@@ -169,5 +169,6 @@ if __name__ == "__main__":
     scraper = AIToolsScraper()
     scraper.run()
     scraper.close()
+
 
 
