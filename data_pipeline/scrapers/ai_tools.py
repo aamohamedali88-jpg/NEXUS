@@ -19,7 +19,6 @@ class AIToolsScraper:
         self.items = []
 
     def scrape_huggingface_models(self) -> List[Dict]:
-        """Collect trending ML models from HuggingFace API."""
         logger.info("Scraping HuggingFace models...")
 
         url = "https://huggingface.co/api/models"
@@ -60,7 +59,6 @@ class AIToolsScraper:
             return []
 
     def scrape_github_ai_repos(self) -> List[Dict]:
-        """Collect trending AI/ML repositories from GitHub."""
         logger.info("Scraping GitHub AI repositories...")
 
         url = "https://api.github.com/search/repositories"
@@ -101,7 +99,6 @@ class AIToolsScraper:
             return []
 
     def scrape_awesome_lists(self) -> List[Dict]:
-        """Collect AI tools from community awesome lists."""
         logger.info("Scraping awesome lists...")
 
         url = "https://api.github.com/repos/openai/awesome-ai/readme"
@@ -147,7 +144,6 @@ class AIToolsScraper:
             return []
 
     def save_ai_tools(self, tools: List[Dict]):
-        """Save scraped tools into Firestore."""
         logger.info("Saving AI tools to Firestore...")
 
         collection = db.collection("ai_tools")
@@ -159,7 +155,6 @@ class AIToolsScraper:
         logger.info(f"Saved {len(tools)} AI tools to Firestore")
 
     def run(self) -> List[Dict]:
-        """Run all AI scrapers and save results."""
         all_items = []
         all_items.extend(self.scrape_huggingface_models())
         all_items.extend(self.scrape_github_ai_repos())
@@ -167,13 +162,11 @@ class AIToolsScraper:
 
         self.items = all_items
 
-        # Save to Firestore
         self.save_ai_tools(all_items)
 
         return all_items
 
     def close(self):
-        """Cleanup."""
         self.http_client.close()
 
 
