@@ -157,7 +157,7 @@ class AIToolsScraper:
 
         self.items = all_items
 
-        self.save_ai_tools(all_items)
+        self.save_ai_pro_sources(all_items)
 
         return all_items
 
@@ -169,4 +169,5 @@ if __name__ == "__main__":
     scraper = AIToolsScraper()
     scraper.run()
     scraper.close()
+
 
