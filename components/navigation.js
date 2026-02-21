@@ -25,7 +25,7 @@ const Navigation = (props) => {
                   </a>
                 </li>
                 <li className="navigation-link-item">
-                  <a href="AI_Tools">
+                  <a href="ai_tools">
                     <div className="navigation-link">
                       <span>AI Pro</span>
                     </div>
@@ -309,5 +309,6 @@ Navigation.propTypes = {
 }
 
 export default Navigation
+
 
 
