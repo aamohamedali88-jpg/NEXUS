@@ -8,6 +8,7 @@ Scraper for AI Tools and ML Models from open sources.
 import json
 from typing import List, Dict, Optional
 from utils.scraper_utils import HTTPClient, normalize_item, logger
+from data_pipeline.firebase_admin_setup import db
 
 
 class AIToolsScraper:
@@ -155,3 +156,4 @@ class AIToolsScraper:
     def close(self):
         """Cleanup."""
         self.http_client.close()
+
