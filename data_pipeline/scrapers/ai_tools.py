@@ -156,4 +156,17 @@ class AIToolsScraper:
     def close(self):
         """Cleanup."""
         self.http_client.close()
+   
+    def save_ai_tools(tools):
+    collection = db.collection("ai_tools")
+
+    for tool in tools:
+        doc_id = tool["title"].replace(" ", "_").lower()
+        collection.document(doc_id).set({
+            "title": tool["title"],
+            "description": tool["description"],
+            "url": tool["url"],
+            "tags": tool.get("tags", []),
+        })
+
 
