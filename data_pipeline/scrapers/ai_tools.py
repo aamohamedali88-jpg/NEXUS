@@ -113,13 +113,7 @@ class AIToolsScraper:
             items = []
 
             import re
-            pattern = r'
-
-\[([^\]
-
-]+)\]
-
-\(([^)]+)\)'
+            pattern = r'\[([^\]]+)\]\(([^)]+)\)'
             matches = re.findall(pattern, content)
 
             for title, url in matches[:30]:
@@ -174,3 +168,4 @@ if __name__ == "__main__":
     scraper = AIToolsScraper()
     scraper.run()
     scraper.close()
+
