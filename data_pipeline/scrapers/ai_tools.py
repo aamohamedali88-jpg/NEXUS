@@ -139,15 +139,18 @@ class AIToolsScraper:
     def save_ai_tools(self, tools: List[Dict]):
         logger.info("Saving AI tools to Firestore...")
 
-        collection = db.collection("ai_pro")
+        # Save to BOTH collections
+        collection_main = db.collection("ai_pro")
+        collection_sources = db.collection("ai_pro_sources")
 
         for tool in tools:
             # Safe Firestore document ID
             doc_id = re.sub(r'[^a-zA-Z0-9_-]+', '_', tool["title"]).lower()
 
-            collection.document(doc_id).set(tool)
+            collection_main.document(doc_id).set(tool)
+            collection_sources.document(doc_id).set(tool)
 
-        logger.info(f"Saved {len(tools)} AI tools to Firestore")
+        logger.info(f"Saved {len(tools)} AI tools to Firestore (ai_pro + ai_pro_sources)")
 
     def run(self) -> List[Dict]:
         all_items = []
@@ -157,7 +160,8 @@ class AIToolsScraper:
 
         self.items = all_items
 
-        self.save_ai_pro(all_items)
+        # FIXED: correct function name
+        self.save_ai_tools(all_items)
 
         return all_items
 
@@ -169,6 +173,3 @@ if __name__ == "__main__":
     scraper = AIToolsScraper()
     scraper.run()
     scraper.close()
-
-
-
