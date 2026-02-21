@@ -6,6 +6,7 @@ Scraper for AI Tools and ML Models from open sources.
 """
 
 import json
+import re
 from typing import List, Dict
 from data_pipeline.utils.scraper_utils import HTTPClient, normalize_item, logger
 from data_pipeline.firebase_admin_setup import db
@@ -63,7 +64,7 @@ class AIToolsScraper:
 
         url = "https://api.github.com/search/repositories"
         params = {
-            "q": "topic:machine-learning OR topic:artificial-intelligence language:python",
+            "q": "(topic:machine-learning OR topic:artificial-intelligence) language:python",
             "sort": "stars",
             "order": "desc",
             "per_page": 50
@@ -102,7 +103,6 @@ class AIToolsScraper:
         logger.info("Scraping awesome lists...")
 
         url = "https://api.github.com/repos/openai/awesome-ai/readme"
-        headers = {"Accept": "application/vnd.github.v3.raw"}
 
         response = self.http_client.get(url)
         if not response:
@@ -112,8 +112,13 @@ class AIToolsScraper:
             content = response.text
             items = []
 
-            import re
-            pattern = r'\[([^\]]+)\]\(([^)]+)\)'
+            pattern = r'
+
+\[([^\]
+
+]+)\]
+
+\(([^)]+)\)'
             matches = re.findall(pattern, content)
 
             for title, url in matches[:30]:
@@ -138,18 +143,17 @@ class AIToolsScraper:
             return []
 
     def save_ai_tools(self, tools: List[Dict]):
-    logger.info("Saving AI tools to Firestore...")
+        logger.info("Saving AI tools to Firestore...")
 
-    import re
-    collection = db.collection("ai_tools")
+        collection = db.collection("ai_tools")
 
-    for tool in tools:
-        # Safe Firestore document ID
-        doc_id = re.sub(r'[^a-zA-Z0-9_-]+', '_', tool["title"]).lower()
+        for tool in tools:
+            # Safe Firestore document ID
+            doc_id = re.sub(r'[^a-zA-Z0-9_-]+', '_', tool["title"]).lower()
 
-        collection.document(doc_id).set(tool)
+            collection.document(doc_id).set(tool)
 
-    logger.info(f"Saved {len(tools)} AI tools to Firestore")
+        logger.info(f"Saved {len(tools)} AI tools to Firestore")
 
     def run(self) -> List[Dict]:
         all_items = []
@@ -171,6 +175,3 @@ if __name__ == "__main__":
     scraper = AIToolsScraper()
     scraper.run()
     scraper.close()
-
-
-
