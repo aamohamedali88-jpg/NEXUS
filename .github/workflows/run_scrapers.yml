@@ -1,9 +1,9 @@
 name: Run AI Tools Scraper
 
 on:
-  workflow_dispatch:      # allows manual run
+  workflow_dispatch:
   schedule:
-    - cron: "0 */12 * * *"   # runs every 12 hours
+    - cron: "0 */12 * * *"
 
 jobs:
   scrape:
@@ -21,6 +21,9 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
+
+      - name: Add project to PYTHONPATH
+        run: echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
 
       - name: Run AI Tools Scraper
         env:
