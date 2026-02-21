@@ -10,18 +10,14 @@ from pathlib import Path
 from datetime import datetime
 import logging
 
-# Add scrapers to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'scrapers'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'utils'))
+from data_pipeline.scrapers.ai_tools import AIToolsScraper
+from data_pipeline.scrapers.islamic import IslamicResourcesScraper
+from data_pipeline.scrapers.education import EducationScraper
+from data_pipeline.scrapers.marketplace import MarketplaceScraper
+from data_pipeline.scrapers.productivity import ProductivityToolsScraper
 
-from scrapers.ai_tools import AIToolsScraper
-from scrapers.islamic import IslamicResourcesScraper
-from scrapers.education import EducationScraper
-from scrapers.marketplace import MarketplaceScraper
-from scrapers.productivity import ProductivityToolsScraper
-
-from utils.scraper_utils import (
-    save_json, load_json, deduplicate_items, 
+from data_pipeline.utils.scraper_utils import (
+    save_json, load_json, deduplicate_items,
     filter_valid_items, merge_json_files
 )
 
@@ -201,3 +197,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
