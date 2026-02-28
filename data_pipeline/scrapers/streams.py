@@ -9,7 +9,7 @@ Inspired by fmhy-style link aggregation, but restricted to legal / open sources 
 
 import re
 from typing import List, Dict
-from utils.scraper_utils import HTTPClient, normalize_item, logger
+from data_pipeline.utils.scraper_utils import HTTPClient, normalize_item, logger
 from data_pipeline.firebase_admin_setup import db
 
 
