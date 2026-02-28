@@ -33,13 +33,7 @@ class ProductivityToolsScraper:
             content = response.text
             items = []
 
-            pattern = r'
-
-\[([^\]
-
-]+)\]
-
-\(([^)]+)\)'
+            pattern = r'\[([^\]]+)\]\(([^)]+)\)'
             matches = re.findall(pattern, content)
 
             for title, url_match in matches[:100]:
@@ -213,4 +207,5 @@ if __name__ == "__main__":
     scraper = ProductivityToolsScraper()
     scraper.run()
     scraper.close()
+
 
