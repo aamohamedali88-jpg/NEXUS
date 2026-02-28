@@ -18,35 +18,35 @@ const Navigation = (props) => {
             <div className="navigation-desktop-menu">
               <ul className="navigation-links-list">
                 <li className="navigation-link-item">
-                  <a href="community">
+                  <a href="/community">
                     <div className="navigation-link">
                       <span>Community</span>
                     </div>
                   </a>
                 </li>
                 <li className="navigation-link-item">
-                  <a href="ai_tools">
+                  <a href="/ai-pro">
                     <div className="navigation-link">
                       <span>AI Pro</span>
                     </div>
                   </a>
                 </li>
                 <li className="navigation-link-item">
-                  <a href="Homepage">
+                  <a href="/education">
                     <div className="navigation-link">
                       <span>Education</span>
                     </div>
                   </a>
                 </li>
                 <li className="navigation-link-item">
-                  <a href="Homepage">
+                  <a href="/marketplace">
                     <div className="navigation-link">
                       <span>Marketplace</span>
                     </div>
                   </a>
                 </li>
                 <li className="navigation-link-item">
-                  <a href="Homepage">
+                  <a href="/streams">
                     <div className="navigation-link">
                       <span>Streams</span>
                     </div>
@@ -72,7 +72,7 @@ const Navigation = (props) => {
                   </svg>
                   <span className="navigation-text15">Connect Wallet</span>
                 </button>
-                <a href="Homepage">
+                <a href="/">
                   <div className="btn-primary btn-sm btn">
                     <span className="navigation-text16">Sign In</span>
                   </div>
@@ -104,7 +104,7 @@ const Navigation = (props) => {
         </nav>
         <div id="mobile-overlay" className="navigation-mobile-overlay">
           <div className="navigation-overlay-header">
-            <a href="Homepage">
+            <a href="/">
               <div className="navigation-brand-link">
                 <span className="navigation-brand-text section-title">
                   HUSIN
@@ -135,49 +135,49 @@ const Navigation = (props) => {
           <div className="navigation-overlay-content">
             <ul className="navigation-overlay-links">
               <li className="navigation-overlay-item">
-                <a href="Homepage">
+                <a href="/community">
                   <div className="navigation-overlay-link">
                     <span>Community Hub</span>
                   </div>
                 </a>
               </li>
               <li className="navigation-overlay-item">
-                <a href="Homepage">
+                <a href="/ai-pro">
                   <div className="navigation-overlay-link">
                     <span>AI Nexus</span>
                   </div>
                 </a>
               </li>
               <li className="navigation-overlay-item">
-                <a href="Homepage">
+                <a href="/education">
                   <div className="navigation-overlay-link">
                     <span>Academy</span>
                   </div>
                 </a>
               </li>
               <li className="navigation-overlay-item">
-                <a href="Homepage">
+                <a href="/marketplace">
                   <div className="navigation-overlay-link">
                     <span>E-Marketplace</span>
                   </div>
                 </a>
               </li>
               <li className="navigation-overlay-item">
-                <a href="Homepage">
+                <a href="/jobs">
                   <div className="navigation-overlay-link">
                     <span>Jobs &amp; Freelance</span>
                   </div>
                 </a>
               </li>
               <li className="navigation-overlay-item">
-                <a href="Homepage">
+                <a href="/news">
                   <div className="navigation-overlay-link">
                     <span>Nexus News</span>
                   </div>
                 </a>
               </li>
               <li className="navigation-overlay-item">
-                <a href="Homepage">
+                <a href="/streams">
                   <div className="navigation-overlay-link">
                     <span>Live Streams</span>
                   </div>
@@ -188,7 +188,7 @@ const Navigation = (props) => {
               <button className="navigation-full-width btn-lg btn-accent btn">
                 Connect Wallet
               </button>
-              <a href="Homepage">
+              <a href="/">
                 <div className="navigation-full-width btn-lg btn btn-outline">
                   <span>Sign In</span>
                 </div>
@@ -196,6 +196,7 @@ const Navigation = (props) => {
             </div>
           </div>
         </div>
+        {/* rest of your Script/style blocks unchanged */}
         <div className="navigation-container2">
           <div className="navigation-container3">
             <Script
@@ -260,19 +261,15 @@ const Navigation = (props) => {
           .navigation-container1 {
             display: contents;
           }
-          
           .navigation-image {
             width: 59px;
             height: 69px;
             object-fit: cover;
           }
-          
-          
           .navigation-text15 {
             align-self: center;
             line-height: 2;
           }
-          
           .navigation-text16 {
             color: var(--dl-color-theme-accent1);
             align-self: center;
@@ -309,6 +306,3 @@ Navigation.propTypes = {
 }
 
 export default Navigation
-
-
-
