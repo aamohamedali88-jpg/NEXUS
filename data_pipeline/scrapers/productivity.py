@@ -7,7 +7,7 @@ Scraper for Productivity Tools.
 
 import re
 from typing import List, Dict
-from utils.scraper_utils import HTTPClient, normalize_item, logger
+from data_pipeline.utils.scraper_utils import HTTPClient, normalize_item, logger
 from data_pipeline.firebase_admin_setup import db
 
 
@@ -213,3 +213,4 @@ if __name__ == "__main__":
     scraper = ProductivityToolsScraper()
     scraper.run()
     scraper.close()
+
