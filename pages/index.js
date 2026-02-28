@@ -14,17 +14,18 @@ const Home = (props) => {
         <Head>
           <title>Memorable Marvelous Bee</title>
           <meta property="og:title" content="Memorable Marvelous Bee" />
-
         </Head>
-        <Navigation rootClassName="navigationroot-class-name"></Navigation>
+
+        <Navigation rootClassName="navigationroot-class-name" />
+
         <section className="unified-hero">
           <div className="unified-hero-bg">
             <video
               src="https://videos.pexels.com/video-files/3141208/3141208-hd_1280_720_25fps.mp4"
-              loop="true"
-              muted="true"
-              autoPlay="true"
-              playsInline="true"
+              loop
+              muted
+              autoPlay
+              playsInline
               className="unified-hero-video"
             ></video>
             <div className="unified-hero-overlay"></div>
@@ -33,41 +34,13 @@ const Home = (props) => {
             <div className="unified-hero-main">
               <h1 className="hero-title">
                 <span>H</span>
-                <span>
-                  yper
-                  <span
-                    dangerouslySetInnerHTML={{
-                      __html: ' ',
-                    }}
-                  />
-                </span>
+                <span>yper </span>
                 <span>U</span>
-                <span>
-                  nified
-                  <span
-                    dangerouslySetInnerHTML={{
-                      __html: ' ',
-                    }}
-                  />
-                </span>
+                <span>nified </span>
                 <span>S</span>
-                <span>
-                  pacetime
-                  <span
-                    dangerouslySetInnerHTML={{
-                      __html: ' ',
-                    }}
-                  />
-                </span>
+                <span>pacetime </span>
                 <span>I</span>
-                <span>
-                  ntegration
-                  <span
-                    dangerouslySetInnerHTML={{
-                      __html: ' ',
-                    }}
-                  />
-                </span>
+                <span>ntegration </span>
                 <span>N</span>
                 <span>exus</span>
               </h1>
@@ -258,6 +231,8 @@ const Home = (props) => {
             </div>
           </div>
         </section>
+
+        {/* CATEGORIES GRID WITH FIXED LINKS */}
         <div className="categories-grid">
           <div className="category-card">
             <div className="category-icon">
@@ -281,7 +256,7 @@ const Home = (props) => {
             <p className="section-content">
               A dedicated ecosystem serving the global Muslim community with authentic resources, spiritual guidance, and cultural content.
             </p>
-            <a href="#">
+            <a href="/islamic">
               <div className="btn-link">
                 <span>Explore Community</span>
               </div>
@@ -312,7 +287,7 @@ const Home = (props) => {
             <p className="section-content">
               Harness cutting-edge artificial intelligence tools and datasets specifically designed for professionals and developers.
             </p>
-            <a href="#">
+            <a href="/ai-pro-sources">
               <div className="btn-link">
                 <span>Access AI Lab</span>
               </div>
@@ -342,7 +317,7 @@ const Home = (props) => {
             <p className="section-content">
               Access premium live content and entertainment libraries with adaptive bitrate technology ensuring smooth playback across all devices.
             </p>
-            <a href="#">
+            <a href="/streams">
               <div className="btn-link">
                 <span>Watch Now</span>
               </div>
@@ -372,7 +347,7 @@ const Home = (props) => {
             <p className="section-content">
               Transform your career through structured learning pathways, expert-led instruction, and industry-recognized certifications.
             </p>
-            <a href="#">
+            <a href="/education">
               <div className="btn-link">
                 <span>Start Learning</span>
               </div>
@@ -403,7 +378,7 @@ const Home = (props) => {
             <p className="section-content">
               A modern digital commerce platform connecting sellers and buyers for digital products, services, and curated offerings with secure transactions.
             </p>
-            <a href="#">
+            <a href="/marketplace">
               <div className="btn-link">
                 <span>Browse Store</span>
               </div>
@@ -433,23 +408,24 @@ const Home = (props) => {
             <p className="section-content">
               Global opportunities for tech talent and creative professionals.
             </p>
-            <a href="#">
+            <a href="/jobs">
               <div className="btn-link">
                 <span>Find Work</span>
               </div>
             </a>
           </div>
         </div>
+
         <section className="streams-preview">
           <div className="streams-container">
             <div className="streams-featured">
               <div className="streams-video-wrapper">
                 <video
                   src="https://videos.pexels.com/video-files/34645102/14683780_640_360_30fps.mp4"
-                  loop="true"
-                  muted="true"
+                  loop
+                  muted
                   poster="https://images.pexels.com/videos/34645102/pictures/preview-0.jpg"
-                  autoPlay="true"
+                  autoPlay
                   className="streams-video"
                 ></video>
                 <div className="streams-video-overlay">
@@ -502,6 +478,7 @@ const Home = (props) => {
             </div>
           </div>
         </section>
+
         <section className="get-started">
           <div className="started-container">
             <h2 className="section-title">Begin Your Integration</h2>
@@ -548,6 +525,7 @@ const Home = (props) => {
             </div>
           </div>
         </section>
+
         <div className="home-container2">
           <div className="home-container3">
             <Script
@@ -612,8 +590,10 @@ const Home = (props) => {
             ></Script>
           </div>
         </div>
+
         <Footer></Footer>
       </div>
+
       <style jsx>
         {`
           .home-container1 {
@@ -931,8 +911,3 @@ const Home = (props) => {
 }
 
 export default Home
-
-
-
-
-
