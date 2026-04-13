@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useState } from 'react'
 import Head from 'next/head'
 
 import Script from 'dangerous-html/react'
@@ -6,8 +6,11 @@ import { useTranslations } from 'next-intl'
 
 import Navigation from '../components/navigation'
 import Footer from '../components/footer'
+import SubscribeModal from '../components/subscribe-modal'
 
 const Home = (props) => {
+  const [showSubscribe, setShowSubscribe] = useState(false)
+
   return (
     <>
       <div className="home-container1">
@@ -54,7 +57,10 @@ const Home = (props) => {
                   src="/logo_logo-200h-200h.png"
                   className="home-image"
                 />
-                <button className="btn-lg btn btn-outline">
+                <button
+                  className="btn-lg btn btn-outline"
+                  onClick={() => setShowSubscribe(true)}
+                >
                   Subscribe
                 </button>
               </div>
@@ -593,6 +599,12 @@ const Home = (props) => {
 
         <Footer></Footer>
       </div>
+
+      {/* ✅ Subscribe Modal — renders when button clicked */}
+      <SubscribeModal
+        isOpen={showSubscribe}
+        onClose={() => setShowSubscribe(false)}
+      />
 
       <style jsx>
         {`
