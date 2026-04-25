@@ -15,8 +15,8 @@ const Home = (props) => {
     <>
       <div className="home-container1">
         <Head>
-          <title>Memorable Marvelous Bee</title>
-          <meta property="og:title" content="Memorable Marvelous Bee" />
+          <title>HUSIN — Hyper Unified Spacetime Integration Nexus</title>
+          <meta property="og:title" content="HUSIN — Hyper Unified Spacetime Integration Nexus" />
         </Head>
 
         <Navigation rootClassName="navigationroot-class-name" />
