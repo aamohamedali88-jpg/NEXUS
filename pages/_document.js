@@ -10,6 +10,15 @@ class CustomDocument extends Document {
           ></meta>
           <meta charSet="utf-8"></meta>
           <meta property="twitter:card" content="summary_large_image"></meta>
+          <meta name="description" content="HUSIN — The ultimate convergence of AI, Community, Commerce, and Web3. One platform, infinite possibilities." />
+          <meta property="og:site_name" content="HUSIN Nexus" />
+          <meta property="og:description" content="HUSIN — The ultimate convergence of AI, Community, Commerce, and Web3. One platform, infinite possibilities." />
+          <meta property="og:image" content="https://www.husin.org/logo_logo-200h-200h.png" />
+          <meta property="og:url" content="https://www.husin.org" />
+          <meta property="og:type" content="website" />
+          <meta name="twitter:title" content="HUSIN — Hyper Unified Spacetime Integration Nexus" />
+          <meta name="twitter:description" content="The ultimate convergence of AI, Community, Commerce, and Web3." />
+          <meta name="twitter:image" content="https://www.husin.org/logo_logo-200h-200h.png" />
           <style
             dangerouslySetInnerHTML={{
               __html:
