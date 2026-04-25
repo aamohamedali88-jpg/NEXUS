@@ -1,4 +1,3 @@
-js (NEW FILE)
 import { useState } from 'react'
 
 export default function SubscribeModal({ isOpen, onClose }) {
