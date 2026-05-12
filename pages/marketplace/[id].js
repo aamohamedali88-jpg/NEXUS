@@ -275,4 +275,4 @@ export default function ProductPage({ product }) {
       `}</style>
     </>
   )
-  }
+}
