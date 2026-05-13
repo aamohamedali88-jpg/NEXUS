@@ -1,24 +1,13 @@
 /**
  * HUSIN ESHOP — GET /api/shop/sessions
- * Returns list of search sessions for the inbox page
- * PRIVATE — requires x-shop-token header
+ * FIXED: Accepts raw ADMIN_SECRET as token
  */
 
 import { db } from '../../../lib/firebaseAdmin'
-import crypto from 'crypto'
 
 function verifyToken(token) {
   if (!token || !process.env.ADMIN_SECRET) return false
-  if (token === process.env.ADMIN_SECRET) return true
-  for (let i = 0; i <= 2; i++) {
-    const window = Math.floor(Date.now() / 10000) - i
-    const expected = crypto
-      .createHmac('sha256', process.env.ADMIN_SECRET)
-      .update(`husin_shop_${window}`)
-      .digest('hex')
-    if (token === expected) return true
-  }
-  return false
+  return token === process.env.ADMIN_SECRET
 }
 
 export default async function handler(req, res) {
@@ -41,7 +30,7 @@ export default async function handler(req, res) {
       return {
         sessionId:   d.sessionId,
         searchQuery: d.searchQuery,
-        totalFound:  d.totalFound || 0,
+        totalFound:  d.totalFound  || 0,
         viableCount: d.viableCount || 0,
         status:      d.status,
         createdAt:   d.createdAt,
@@ -51,7 +40,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ sessions })
 
   } catch (error) {
-    console.error('[ShopSessions] Error:', error.message)
+    console.error('[ShopSessions]', error.message)
     return res.status(500).json({ error: error.message })
   }
 }
