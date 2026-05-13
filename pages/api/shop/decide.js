@@ -1,25 +1,13 @@
 /**
  * HUSIN ESHOP — POST /api/shop/decide
- * Approve or reject a product from the dashboard inbox
- * Syncs instantly — if decided here, Telegram buttons freeze too
- * PRIVATE — requires x-shop-token header
+ * FIXED: Accepts raw ADMIN_SECRET as token
  */
 
 import { db } from '../../../lib/firebaseAdmin'
-import crypto from 'crypto'
 
 function verifyToken(token) {
   if (!token || !process.env.ADMIN_SECRET) return false
-  if (token === process.env.ADMIN_SECRET) return true
-  for (let i = 0; i <= 2; i++) {
-    const window = Math.floor(Date.now() / 10000) - i
-    const expected = crypto
-      .createHmac('sha256', process.env.ADMIN_SECRET)
-      .update(`husin_shop_${window}`)
-      .digest('hex')
-    if (token === expected) return true
-  }
-  return false
+  return token === process.env.ADMIN_SECRET
 }
 
 export default async function handler(req, res) {
@@ -51,7 +39,7 @@ export default async function handler(req, res) {
 
     const product = productSnap.data()
 
-    // Already decided — return current state without error
+    // Already decided — return current state
     if (product.decision !== 'pending') {
       return res.status(200).json({
         success:        true,
@@ -68,8 +56,8 @@ export default async function handler(req, res) {
     })
 
     if (decision === 'approved') {
-      // ── Publish to live marketplace ────────────────────────────────────────
-      // Source details stored with _ prefix — NEVER exposed to public
+      // Publish to live marketplace
+      // Source details stored with _ prefix — NEVER exposed publicly
       await db.collection('shop_approved_products').doc(productId).set({
         id:                    productId,
         sessionId,
@@ -81,16 +69,15 @@ export default async function handler(req, res) {
         specifications:        product.specifications || null,
         sourceId:              product.sourceId,
         sourceName:            product.sourceName,
-        _sourceLink:           product.sourceLink,           // HIDDEN FROM PUBLIC
-        _sourcePriceSAR:       product.pricing?.sourcePriceSAR, // HIDDEN
-        _profitSAR:            product.pricing?.profitSAR,      // HIDDEN
+        _sourceLink:           product.sourceLink,
+        _sourcePriceSAR:       product.pricing?.sourcePriceSAR,
+        _profitSAR:            product.pricing?.profitSAR,
         approvedAt:            new Date().toISOString(),
         status:                'live',
         views:                 0,
         sales:                 0,
       })
     } else {
-      // ── Save to rejected list ──────────────────────────────────────────────
       await db.collection('shop_rejected_products').doc(productId).set({
         id:         productId,
         sessionId,
@@ -104,7 +91,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ success: true, productId, decision })
 
   } catch (error) {
-    console.error('[ShopDecide] Error:', error.message)
+    console.error('[ShopDecide]', error.message)
     return res.status(500).json({ error: error.message })
   }
 }
