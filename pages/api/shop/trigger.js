@@ -1,7 +1,8 @@
 /**
  * HUSIN ESHOP — POST /api/shop/trigger
- * FIXED: Targeted search queries per source + robust product extraction
- * Each source gets a query that actually returns products on that site
+ * FINAL VERSION — Uses official eBay Browse API
+ * Guaranteed real products with titles, prices, images, direct links
+ * No scraping — official API data feed — never blocked
  */
 
 import { applyPricingToAll }   from '../../../lib/pricingEngine'
@@ -11,359 +12,149 @@ import { loadExistingFingerprints,
 import { sendBatchToTelegram } from '../../../lib/telegramNotifier'
 import { db }                  from '../../../lib/firebaseAdmin'
 
-const USD_TO_SAR = 3.75
+const EBAY_APP_ID  = process.env.EBAY_APP_ID
+const EBAY_SECRET  = process.env.EBAY_SECRET
+const USD_TO_SAR   = 3.75
 
 function verifyToken(token) {
   if (!token || !process.env.ADMIN_SECRET) return false
   return token === process.env.ADMIN_SECRET
 }
 
-async function safeFetch(url, extraHeaders = {}) {
+// ── Get eBay OAuth token ───────────────────────────────────────────────────────
+async function getEbayToken() {
+  const credentials = Buffer.from(`${EBAY_APP_ID}:${EBAY_SECRET}`).toString('base64')
+  const res = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
+    method:  'POST',
+    headers: {
+      'Authorization': `Basic ${credentials}`,
+      'Content-Type':  'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope',
+    signal: AbortSignal.timeout(10000),
+  })
+  const data = await res.json()
+  if (!data.access_token) {
+    throw new Error(`eBay auth failed: ${JSON.stringify(data)}`)
+  }
+  return data.access_token
+}
+
+// ── Search eBay Browse API ─────────────────────────────────────────────────────
+async function searchEbay(token, query, category, limit = 20) {
   try {
+    const encoded = encodeURIComponent(query)
+    // Using Browse API v1 — most reliable
+    const url = `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encoded}&limit=${limit}&sort=bestMatch&filter=buyingOptions:{FIXED_PRICE}`
+
     const res = await fetch(url, {
       headers: {
-        'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-        'Accept':          'text/html,application/xhtml+xml,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control':   'no-cache',
-        ...extraHeaders,
+        'Authorization':         `Bearer ${token}`,
+        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+        'Content-Type':          'application/json',
       },
       signal: AbortSignal.timeout(12000),
     })
-    if (!res.ok) return null
-    return await res.text()
+
+    if (!res.ok) {
+      console.log(`[eBay] Query "${query}" returned ${res.status}`)
+      return []
+    }
+
+    const data  = await res.json()
+    const items = data.itemSummaries || []
+
+    return items.map(item => {
+      const usdPrice = parseFloat(item.price?.value || '0')
+      const sarPrice = Math.round(usdPrice * USD_TO_SAR)
+
+      return {
+        name:       item.title?.substring(0, 150) || 'eBay Product',
+        rawPrice:   sarPrice,
+        currency:   'SAR',
+        sourceLink: item.itemWebUrl || `https://www.ebay.com/itm/${item.itemId}`,
+        image:      item.image?.imageUrl || item.thumbnailImages?.[0]?.imageUrl || null,
+        sourceId:   'ebay',
+        sourceName: 'eBay',
+        sourceFlag: '🛍️',
+        category,
+        specifications: item.condition || null,
+      }
+    }).filter(p => p.rawPrice > 0 && p.name.length > 5)
+
   } catch (e) {
-    return null
+    console.error(`[eBay] Error for "${query}":`, e.message)
+    return []
   }
 }
 
-// Validate product name — reject page fragments
-function isValidProduct(name) {
-  if (!name || typeof name !== 'string') return false
-  const cleaned = name.trim()
-  if (cleaned.length < 8 || cleaned.length > 200) return false
-  const rejectPatterns = [
-    /^(shipping|quality|return|payment|buyer|seller|feedback|protection|default|category|page|home|search|result|filter|sort|view|all|new|sale|top|best)/i,
-    /^(null|undefined|true|false|n\/a|na)$/i,
-    /^\d+(\.\d+)?(\s*(sar|usd|\$|€|£))?$/i,
-    /^[^a-zA-Z0-9\u0600-\u06FF]{0,5}$/,
-  ]
-  return !rejectPatterns.some(p => p.test(cleaned))
-}
-
-// ── eBay — most reliable ───────────────────────────────────────────────────────
-async function searchEbay(searchTerms, limit = 25) {
-  const items = []
-  for (const term of searchTerms) {
-    if (items.length >= limit) break
-    try {
-      const url = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(term)}&_sop=12&LH_BIN=1&_ipg=48`
-      const html = await safeFetch(url)
-      if (!html) continue
-
-      // Match s-item blocks
-      const itemBlocks = html.match(/class="s-item__pl-on-bottom"[\s\S]{0,2000}?(?=class="s-item__pl-on-bottom"|$)/g) || []
-
-      for (const block of itemBlocks) {
-        if (items.length >= limit) break
-
-        const titleM = block.match(/class="s-item__title"[^>]*>([^<]{8,150})/)
-          || block.match(/<h3[^>]*>([^<]{8,150})<\/h3>/)
-        const priceM = block.match(/class="s-item__price"[^>]*>.*?\$([\d,]+\.?\d*)/s)
-        const linkM  = block.match(/href="(https:\/\/www\.ebay\.com\/itm\/[^"?]{20,})"/)
-        const imgM   = block.match(/src="(https:\/\/i\.ebayimg\.com\/thumbs\/[^"]+)"/)
-
-        const title = titleM?.[1]?.trim().replace(/\s+/g,' ')
-        const price = priceM?.[1]?.replace(/,/g,'')
-        const link  = linkM?.[1]
-        const img   = imgM?.[1]?.replace('/thumbs/','/images/g/')
-
-        if (!isValidProduct(title) || !price || !link) continue
-
-        const usdP = parseFloat(price)
-        if (isNaN(usdP) || usdP <= 0 || usdP > 5000) continue
-
-        items.push({
-          name:       title.substring(0,150),
-          rawPrice:   Math.round(usdP * USD_TO_SAR),
-          currency:   'SAR',
-          sourceLink: link,
-          image:      img || null,
-          sourceId:   'ebay',
-          sourceName: 'eBay',
-          sourceFlag: '🛍️',
-          category:   'general',
-        })
-      }
-    } catch (e) { /* continue */ }
-    await new Promise(r => setTimeout(r, 300))
-  }
-  console.log(`[Trigger] eBay: ${items.length} products`)
-  return items
-}
-
-// ── Amazon Saudi Arabia ────────────────────────────────────────────────────────
-async function searchAmazonSA(searchTerms, limit = 20) {
-  const items = []
-  for (const term of searchTerms) {
-    if (items.length >= limit) break
-    try {
-      const url = `https://www.amazon.sa/s?k=${encodeURIComponent(term)}&s=review-rank&language=en`
-      const html = await safeFetch(url)
-      if (!html) continue
-
-      // Extract product JSON from page
-      const dataMatch = html.match(/data-asin="([A-Z0-9]{10})"[\s\S]{0,3000}?class="a-price-whole"[^>]*>([\d,]+)/g) || []
-
-      // Also try direct title extraction
-      const titleReg = /class="a-size-medium a-color-base a-text-normal"[^>]*>([^<]{8,150})</g
-      const priceReg = /class="a-price-whole"[^>]*>([\d,]+)</g
-      const asinReg  = /data-asin="([A-Z0-9]{10})"/g
-      const imgReg   = /class="s-image"[^>]*src="([^"]+)"/g
-
-      const titles=[], prices=[], asins=[], imgs=[]
-      let m
-      while ((m=titleReg.exec(html))!==null) titles.push(m[1].trim())
-      while ((m=priceReg.exec(html))!==null) prices.push(m[1].replace(/,/g,''))
-      while ((m=asinReg.exec(html))!==null) { if(m[1]!=='undefined') asins.push(m[1]) }
-      while ((m=imgReg.exec(html))!==null) imgs.push(m[1])
-
-      for (let i=0; i<Math.min(titles.length, 8); i++) {
-        if (items.length >= limit) break
-        if (!isValidProduct(titles[i])) continue
-        const sarP = parseFloat(prices[i])
-        if (isNaN(sarP) || sarP <= 0) continue
-
-        items.push({
-          name:       titles[i].substring(0,150),
-          rawPrice:   sarP,
-          currency:   'SAR',
-          sourceLink: asins[i] ? `https://www.amazon.sa/dp/${asins[i]}` : url,
-          image:      imgs[i] || null,
-          sourceId:   'amazon_sa',
-          sourceName: 'Amazon.sa',
-          sourceFlag: '🇸🇦',
-          category:   'general',
-        })
-      }
-    } catch (e) { /* continue */ }
-    await new Promise(r => setTimeout(r, 400))
-  }
-  console.log(`[Trigger] Amazon.sa: ${items.length} products`)
-  return items
-}
-
-// ── Noon.com ──────────────────────────────────────────────────────────────────
-async function searchNoon(searchTerms, limit = 20) {
-  const items = []
-  for (const term of searchTerms) {
-    if (items.length >= limit) break
-    try {
-      const url = `https://www.noon.com/saudi-en/search/?q=${encodeURIComponent(term)}&sort%5Bby%5D=popularity`
-      const html = await safeFetch(url)
-      if (!html) continue
-
-      // Try __NEXT_DATA__
-      const nextM = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]+?)<\/script>/)
-      if (nextM) {
-        try {
-          const data = JSON.parse(nextM[1])
-          const hits = data?.props?.pageProps?.catalog?.hits
-            || data?.props?.pageProps?.initialData?.hits || []
-
-          for (const h of hits.slice(0, 8)) {
-            if (items.length >= limit) break
-            if (!isValidProduct(h.name)) continue
-            const price = parseFloat(h.price)
-            if (isNaN(price) || price <= 0) continue
-
-            items.push({
-              name:       h.name.substring(0,150),
-              rawPrice:   price,
-              currency:   'SAR',
-              sourceLink: h.sku ? `https://www.noon.com/saudi-en/${h.sku}/p/` : url,
-              image:      h.image_keys?.[0] ? `https://f.nooncdn.com/p/${h.image_keys[0]}_A.jpg` : null,
-              sourceId:   'noon_sa',
-              sourceName: 'Noon.com',
-              sourceFlag: '🟡',
-              category:   'general',
-            })
-          }
-        } catch (e) { /* try regex */ }
-      }
-
-      // Regex fallback
-      if (items.length === 0) {
-        const nameReg  = /"name"\s*:\s*"([^"]{8,150})"/g
-        const priceReg = /"price"\s*:\s*(\d+\.?\d*)/g
-        const skuReg   = /"sku"\s*:\s*"([^"]{5,50})"/g
-        let m
-        const names=[], prices=[], skus=[]
-        while ((m=nameReg.exec(html))!==null) names.push(m[1])
-        while ((m=priceReg.exec(html))!==null) prices.push(m[1])
-        while ((m=skuReg.exec(html))!==null) skus.push(m[1])
-
-        for (let i=0; i<Math.min(names.length,8); i++) {
-          if (items.length >= limit) break
-          if (!isValidProduct(names[i])) continue
-          const sarP = parseFloat(prices[i])
-          if (isNaN(sarP) || sarP<=0) continue
-          items.push({
-            name:       names[i].substring(0,150),
-            rawPrice:   sarP,
-            currency:   'SAR',
-            sourceLink: skus[i] ? `https://www.noon.com/saudi-en/${skus[i]}/p/` : url,
-            image:      null,
-            sourceId:   'noon_sa',
-            sourceName: 'Noon.com',
-            sourceFlag: '🟡',
-            category:   'general',
-          })
-        }
-      }
-    } catch (e) { /* continue */ }
-    await new Promise(r => setTimeout(r, 400))
-  }
-  console.log(`[Trigger] Noon: ${items.length} products`)
-  return items
-}
-
-// ── Desertcart Saudi Arabia ───────────────────────────────────────────────────
-async function searchDesertcart(searchTerms, limit = 15) {
-  const items = []
-  for (const term of searchTerms) {
-    if (items.length >= limit) break
-    try {
-      const url = `https://www.desertcart.sa/products?query=${encodeURIComponent(term)}`
-      const html = await safeFetch(url)
-      if (!html) continue
-
-      const nameReg  = /class="[^"]*product[^"]*title[^"]*"[^>]*>([^<]{8,150})</gi
-      const priceReg = /class="[^"]*price[^"]*"[^>]*>[\s\S]{0,50}?SAR\s*([\d,]+\.?\d*)/g
-      const linkReg  = /href="(https:\/\/www\.desertcart\.sa\/products\/[^"]+)"/g
-      const imgReg   = /class="[^"]*product[^"]*image[^"]*"[\s\S]{0,200}?src="([^"]+)"/g
-
-      let m
-      const names=[], prices=[], links=[], imgs=[]
-      while ((m=nameReg.exec(html))!==null) names.push(m[1].trim())
-      while ((m=priceReg.exec(html))!==null) prices.push(m[1].replace(/,/g,''))
-      while ((m=linkReg.exec(html))!==null) links.push(m[1])
-      while ((m=imgReg.exec(html))!==null) imgs.push(m[1])
-
-      for (let i=0; i<Math.min(names.length,8); i++) {
-        if (items.length >= limit) break
-        if (!isValidProduct(names[i])) continue
-        const sarP = parseFloat(prices[i])
-        if (isNaN(sarP) || sarP<=0) continue
-        items.push({
-          name:       names[i].substring(0,150),
-          rawPrice:   sarP,
-          currency:   'SAR',
-          sourceLink: links[i] || url,
-          image:      imgs[i] || null,
-          sourceId:   'desertcart',
-          sourceName: 'Desertcart',
-          sourceFlag: '🏜️',
-          category:   'general',
-        })
-      }
-    } catch (e) { /* continue */ }
-    await new Promise(r => setTimeout(r, 300))
-  }
-  console.log(`[Trigger] Desertcart: ${items.length} products`)
-  return items
-}
-
-// ── Ubuy Saudi Arabia ─────────────────────────────────────────────────────────
-async function searchUbuy(searchTerms, limit = 15) {
-  const items = []
-  for (const term of searchTerms) {
-    if (items.length >= limit) break
-    try {
-      const url = `https://www.ubuy.com.sa/en/search/?q=${encodeURIComponent(term)}`
-      const html = await safeFetch(url)
-      if (!html) continue
-
-      const nameReg  = /"name"\s*:\s*"([^"]{8,150})"/g
-      const priceReg = /"price"\s*:\s*"?([\d.]+)"?/g
-      const urlReg   = /"url"\s*:\s*"(https?:\/\/www\.ubuy[^"]+)"/g
-      const imgReg   = /"image"\s*:\s*"(https?:[^"]+)"/g
-
-      let m
-      const names=[], prices=[], urls=[], imgs=[]
-      while ((m=nameReg.exec(html))!==null) names.push(m[1])
-      while ((m=priceReg.exec(html))!==null) prices.push(m[1])
-      while ((m=urlReg.exec(html))!==null) urls.push(m[1])
-      while ((m=imgReg.exec(html))!==null) imgs.push(m[1])
-
-      for (let i=0; i<Math.min(names.length,8); i++) {
-        if (items.length >= limit) break
-        if (!isValidProduct(names[i])) continue
-        const sarP = parseFloat(prices[i])
-        if (isNaN(sarP) || sarP<=0) continue
-        items.push({
-          name:       names[i].substring(0,150),
-          rawPrice:   sarP,
-          currency:   'SAR',
-          sourceLink: urls[i] || url,
-          image:      imgs[i] || null,
-          sourceId:   'ubuy',
-          sourceName: 'Ubuy',
-          sourceFlag: '🌐',
-          category:   'general',
-        })
-      }
-    } catch (e) { /* continue */ }
-    await new Promise(r => setTimeout(r, 300))
-  }
-  console.log(`[Trigger] Ubuy: ${items.length} products`)
-  return items
-}
-
-// ── Namshi ────────────────────────────────────────────────────────────────────
-async function searchNamshi(searchTerms, limit = 15) {
-  const items = []
-  for (const term of searchTerms) {
-    if (items.length >= limit) break
-    try {
-      const url = `https://www.namshi.com/saudi-en/search/?q=${encodeURIComponent(term)}`
-      const html = await safeFetch(url)
-      if (!html) continue
-
-      const nextM = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]+?)<\/script>/)
-      if (nextM) {
-        try {
-          const data  = JSON.parse(nextM[1])
-          const prods = data?.props?.pageProps?.initialData?.products
-            || data?.props?.pageProps?.data?.products || []
-
-          for (const p of prods.slice(0,8)) {
-            if (items.length >= limit) break
-            const name  = p.name || p.title
-            const price = p.price || p.salePrice
-            if (!isValidProduct(name) || !price) continue
-            const sarP = parseFloat(String(price).replace(/[^0-9.]/g,''))
-            if (isNaN(sarP) || sarP<=0) continue
-            items.push({
-              name:       name.substring(0,150),
-              rawPrice:   sarP,
-              currency:   'SAR',
-              sourceLink: p.url || url,
-              image:      p.image || null,
-              sourceId:   'namshi',
-              sourceName: 'Namshi',
-              sourceFlag: '👗',
-              category:   'clothes_women',
-            })
-          }
-        } catch (e) { /* ignore */ }
-      }
-    } catch (e) { /* continue */ }
-    await new Promise(r => setTimeout(r, 300))
-  }
-  console.log(`[Trigger] Namshi: ${items.length} products`)
-  return items
-}
+// ── All search queries targeting Saudi Arabia trending products ───────────────
+const SEARCH_QUERIES = [
+  // Mobile phones & tablets
+  { query: 'iPhone 15 Pro',              category: 'mobiles' },
+  { query: 'Samsung Galaxy S24',         category: 'mobiles' },
+  { query: 'iPad Air',                   category: 'laptops' },
+  { query: 'Samsung Galaxy Tab',         category: 'laptops' },
+  // Laptops & computers
+  { query: 'MacBook Pro M3',             category: 'laptops' },
+  { query: 'Dell XPS laptop',            category: 'laptops' },
+  { query: 'HP laptop gaming',           category: 'laptops' },
+  // Audio & accessories
+  { query: 'AirPods Pro',                category: 'electronics' },
+  { query: 'Sony WH-1000XM5 headphones', category: 'electronics' },
+  { query: 'Bose QuietComfort',          category: 'electronics' },
+  // Smart watches
+  { query: 'Apple Watch Series 9',       category: 'electronics' },
+  { query: 'Samsung Galaxy Watch',       category: 'electronics' },
+  { query: 'Garmin smartwatch',          category: 'electronics' },
+  // Men fashion
+  { query: 'Nike Air Max sneakers men',  category: 'clothes_men' },
+  { query: 'Adidas Ultraboost men',      category: 'clothes_men' },
+  { query: 'Ralph Lauren polo shirt',    category: 'clothes_men' },
+  { query: 'Tommy Hilfiger men',         category: 'clothes_men' },
+  // Women fashion
+  { query: 'Zara women dress',           category: 'clothes_women' },
+  { query: 'Coach handbag women',        category: 'clothes_women' },
+  { query: 'Michael Kors bag',           category: 'clothes_women' },
+  { query: 'Nike women shoes',           category: 'clothes_women' },
+  // Kids
+  { query: 'LEGO set kids',             category: 'toys' },
+  { query: 'baby monitor',              category: 'clothes_kids' },
+  { query: 'kids learning tablet',      category: 'toys' },
+  // Home appliances
+  { query: 'Dyson vacuum cleaner',      category: 'home_appliances' },
+  { query: 'Nespresso coffee machine',  category: 'home_appliances' },
+  { query: 'Philips air fryer',         category: 'home_appliances' },
+  { query: 'KitchenAid mixer',          category: 'home_appliances' },
+  // Beauty & personal care
+  { query: 'La Mer skincare set',       category: 'beauty' },
+  { query: 'Dyson Airwrap hair',        category: 'beauty' },
+  { query: 'perfume men luxury',        category: 'beauty' },
+  { query: 'Charlotte Tilbury makeup',  category: 'beauty' },
+  // Jewelry & luxury
+  { query: 'gold bracelet 18k women',   category: 'jewelry' },
+  { query: 'diamond ring gold',         category: 'jewelry' },
+  { query: 'Pandora charm bracelet',    category: 'jewelry' },
+  { query: 'luxury watch men gold',     category: 'jewelry' },
+  // Sports & fitness
+  { query: 'Peloton exercise bike',     category: 'sports' },
+  { query: 'gym weights dumbbells set', category: 'sports' },
+  { query: 'Nike running shoes',        category: 'sports' },
+  { query: 'Fitbit fitness tracker',    category: 'sports' },
+  // Gaming
+  { query: 'PlayStation 5 PS5',        category: 'electronics' },
+  { query: 'Xbox Series X',            category: 'electronics' },
+  { query: 'Nintendo Switch OLED',     category: 'electronics' },
+  // Cameras
+  { query: 'Sony mirrorless camera',   category: 'electronics' },
+  { query: 'GoPro Hero 12',            category: 'electronics' },
+  { query: 'DJI drone Mini',           category: 'electronics' },
+  // General trending
+  { query: 'robot vacuum cleaner',     category: 'home_appliances' },
+  { query: 'smart home device Alexa',  category: 'electronics' },
+  { query: 'portable power bank',      category: 'electronics' },
+  { query: 'wireless charger fast',    category: 'electronics' },
+]
 
 // ── Main handler ───────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
@@ -375,110 +166,115 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' })
   }
 
-  const sessionId   = `shop_session_${Date.now()}`
+  if (!EBAY_APP_ID || !EBAY_SECRET) {
+    return res.status(500).json({ error: 'EBAY_APP_ID or EBAY_SECRET not configured in Vercel env vars' })
+  }
+
+  const sessionId = `shop_session_${Date.now()}`
   const searchQuery = req.body?.searchQuery || 'trending products 2026'
 
-  // Targeted search terms that work well on each platform
-  const ebayTerms       = ['iPhone 15','Samsung Galaxy S24','Nike shoes men','Adidas sneakers','laptop Dell','Sony headphones','Apple Watch','Samsung TV','KitchenAid mixer','Dyson vacuum']
-  const amazonTerms     = ['iPhone','Samsung','laptop','headphones','smart watch','perfume','sunglasses','coffee maker','air fryer','gaming chair']
-  const noonTerms       = ['iPhone','Samsung','laptop','perfume men','Nike','Adidas','headphones','smart watch','coffee machine','vacuum cleaner']
-  const desertcartTerms = ['Apple iPhone','Samsung Galaxy','Sony PlayStation','Nintendo Switch','Bose headphones','GoPro camera']
-  const ubuyTerms       = ['iPhone accessories','Samsung accessories','fitness tracker','bluetooth speaker','electric toothbrush']
-  const namshiTerms     = ['Nike','Adidas','Zara','Calvin Klein','Tommy Hilfiger','Guess bag','Ray-Ban']
-
-  console.log(`[ShopTrigger] Session ${sessionId} starting`)
+  console.log(`[ShopTrigger] Session ${sessionId} — eBay API`)
 
   try {
-    // Run all sources in parallel
-    const [ebay, amazon, noon, desertcart, ubuy, namshi] = await Promise.allSettled([
-      searchEbay(ebayTerms, 25),
-      searchAmazonSA(amazonTerms, 20),
-      searchNoon(noonTerms, 20),
-      searchDesertcart(desertcartTerms, 15),
-      searchUbuy(ubuyTerms, 15),
-      searchNamshi(namshiTerms, 15),
-    ])
+    // ── Step 1: Get eBay OAuth token ──────────────────────────────────────────
+    console.log('[ShopTrigger] Getting eBay OAuth token...')
+    const ebayToken = await getEbayToken()
+    console.log('[ShopTrigger] eBay token obtained ✅')
 
-    const sourceResults = []
-    const allRaw = []
+    // ── Step 2: Search all queries in batches of 5 ────────────────────────────
+    const allRaw    = []
+    const BATCH     = 5
 
-    const collect = (result, id, name) => {
-      const prods = result.status === 'fulfilled' ? result.value : []
-      const valid = prods.filter(p => isValidProduct(p.name))
-      sourceResults.push({ sourceId: id, sourceName: name, found: valid.length })
-      allRaw.push(...valid)
+    for (let i = 0; i < SEARCH_QUERIES.length; i += BATCH) {
+      const batch   = SEARCH_QUERIES.slice(i, i + BATCH)
+      const results = await Promise.allSettled(
+        batch.map(({ query, category }) => searchEbay(ebayToken, query, category, 5))
+      )
+      results.forEach((result, idx) => {
+        if (result.status === 'fulfilled') {
+          allRaw.push(...result.value)
+          console.log(`[ShopTrigger] "${batch[idx].query}": ${result.value.length} products`)
+        }
+      })
+      // Small pause between batches to respect rate limits
+      if (i + BATCH < SEARCH_QUERIES.length) {
+        await new Promise(r => setTimeout(r, 500))
+      }
     }
 
-    collect(ebay,       'ebay',       'eBay')
-    collect(amazon,     'amazon_sa',  'Amazon.sa')
-    collect(noon,       'noon_sa',    'Noon.com')
-    collect(desertcart, 'desertcart', 'Desertcart')
-    collect(ubuy,       'ubuy',       'Ubuy')
-    collect(namshi,     'namshi',     'Namshi')
+    console.log(`[ShopTrigger] Total raw: ${allRaw.length} products`)
 
-    console.log(`[ShopTrigger] Raw valid: ${allRaw.length} from ${sourceResults.filter(s=>s.found>0).length} sources`)
-
-    // Add IDs
+    // ── Step 3: Add unique IDs ─────────────────────────────────────────────────
     const withIds = allRaw.map((p, i) => ({
-      ...p, id: `prod_${Date.now()}_${i}`,
+      ...p,
+      id: `prod_${Date.now()}_${i}`,
     }))
 
-    // Deduplicate
+    // ── Step 4: Deduplicate against history ────────────────────────────────────
     const existingFPs = await loadExistingFingerprints('shop_initial_products')
     const newProducts = filterNewProducts(withIds, existingFPs)
+    console.log(`[ShopTrigger] After dedup: ${newProducts.length} new products`)
 
-    // Apply pricing
-    const priced  = applyPricingToAll(newProducts)
-    const ranked  = priced.map((p, i) => ({
-      ...p, rank: i+1, status: 'pending', decision: 'pending',
+    // ── Step 5: Apply your pricing rules ──────────────────────────────────────
+    const priced = applyPricingToAll(newProducts)
+    const ranked = priced.map((p, i) => ({
+      ...p,
+      rank:       i + 1,
+      status:     'pending',
+      decision:   'pending',
       searchedAt: new Date().toISOString(),
     }))
 
-    console.log(`[ShopTrigger] Final: ${ranked.length} (${ranked.filter(p=>p.pricing?.isViable).length} viable)`)
+    console.log(`[ShopTrigger] Viable products: ${ranked.filter(p => p.pricing?.isViable).length}`)
 
-    // Save session
+    // ── Step 6: Save session to Firestore ─────────────────────────────────────
     await db.collection('shop_search_sessions').doc(sessionId).set({
-      sessionId, searchQuery,
+      sessionId,
+      searchQuery,
       totalFound:  ranked.length,
-      viableCount: ranked.filter(p=>p.pricing?.isViable).length,
-      sourceResults,
-      status:    'pending_review',
-      createdAt: new Date().toISOString(),
+      viableCount: ranked.filter(p => p.pricing?.isViable).length,
+      status:      'pending_review',
+      createdAt:   new Date().toISOString(),
     })
 
-    // Save products
-    for (let i=0; i<ranked.length; i+=400) {
+    // Save individual products
+    for (let i = 0; i < ranked.length; i += 400) {
       const batch = db.batch()
-      ranked.slice(i,i+400).forEach(p => {
+      ranked.slice(i, i + 400).forEach(p => {
         batch.set(
-          db.collection('shop_search_sessions').doc(sessionId)
-            .collection('products').doc(p.id),
+          db.collection('shop_search_sessions')
+            .doc(sessionId)
+            .collection('products')
+            .doc(p.id),
           { ...p, sessionId }
         )
       })
       await batch.commit()
     }
 
-    // Save to initial list
+    // ── Step 7: Save to initial list (no repeats next time) ───────────────────
     await saveToInitialList(ranked, 'shop_initial_products')
 
-    // Send to Telegram
-    const tgResult = await sendBatchToTelegram(ranked, sessionId, { searchQuery })
+    // ── Step 8: Send to Telegram ───────────────────────────────────────────────
+    const tgResult = await sendBatchToTelegram(
+      ranked, sessionId, { searchQuery }
+    )
 
+    // ── Step 9: Update session status ──────────────────────────────────────────
     await db.collection('shop_search_sessions').doc(sessionId).update({
-      status: 'sent_to_telegram', completedAt: new Date().toISOString(),
+      status:      'sent_to_telegram',
+      completedAt: new Date().toISOString(),
     })
 
-    console.log(`[ShopTrigger] ✅ Done — ${ranked.length} products sent to Telegram`)
+    console.log(`[ShopTrigger] ✅ Complete — ${ranked.length} products sent to Telegram`)
 
     return res.status(200).json({
       success:     true,
       sessionId,
       totalFound:  ranked.length,
-      viableCount: ranked.filter(p=>p.pricing?.isViable).length,
-      sourceResults,
+      viableCount: ranked.filter(p => p.pricing?.isViable).length,
       telegram:    tgResult,
-      message:     `Done! Found ${ranked.length} real products from ${sourceResults.filter(s=>s.found>0).length} sources. Check your Telegram!`,
+      message:     `✅ Done! Found ${ranked.length} real products from eBay. Check your Telegram now.`,
     })
 
   } catch (error) {
