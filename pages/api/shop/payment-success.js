@@ -1,7 +1,8 @@
 /**
  * HUSIN ESHOP — GET /api/shop/payment-success
- * PayPal redirects customer here after successful payment
- * Captures the payment, saves order, notifies owner on Telegram
+ * FIXED: This is the ONLY place orders are saved to Firestore
+ * PayPal redirects here after customer completes payment
+ * Captures payment → confirms → THEN saves order → notifies owner
  */
 
 import { db } from '../../../lib/firebaseAdmin'
@@ -21,13 +22,14 @@ async function getAccessToken() {
       'Authorization': `Basic ${credentials}`,
       'Content-Type':  'application/x-www-form-urlencoded',
     },
-    body: 'grant_type=client_credentials',
+    body:   'grant_type=client_credentials',
+    signal: AbortSignal.timeout(10000),
   })
   const data = await res.json()
   return data.access_token
 }
 
-async function notifyOwner(order, product) {
+async function notifyOwner(order, sourceLink) {
   if (!BOT || !CHAT) return
   try {
     const msg = [
@@ -35,20 +37,20 @@ async function notifyOwner(order, product) {
       ``,
       `📦 Product: ${order.productName}`,
       `💰 Amount: ${order.sellingPriceSAR} SAR ($${order.priceUSD} USD)`,
-      `💵 Your Profit: ${order.profitSAR || 'N/A'} SAR`,
+      order.profitSAR ? `💵 Your Profit: ~${order.profitSAR} SAR` : '',
       ``,
       `👤 Customer: ${order.customerName || 'Anonymous'}`,
       `📧 Email: ${order.customerEmail || 'Not provided'}`,
-      `📍 Address: ${order.shippingAddress || 'Not provided'}`,
+      order.shippingAddress ? `📍 Address: ${order.shippingAddress}` : '',
       ``,
       `🆔 Order ID: ${order.orderId}`,
       `✅ Payment: CONFIRMED via PayPal`,
       ``,
-      `🔗 Go buy from source and ship to customer:`,
-      `${product._sourceLink || 'Check admin panel'}`,
+      `ACTION REQUIRED — Buy from source & ship:`,
+      sourceLink || 'Check admin panel',
       ``,
-      `📊 ${SITE}/shop/orders`,
-    ].join('\n')
+      `📊 Orders: ${SITE}/shop/orders`,
+    ].filter(Boolean).join('\n')
 
     await fetch(`https://api.telegram.org/bot${BOT}/sendMessage`, {
       method:  'POST',
@@ -58,6 +60,7 @@ async function notifyOwner(order, product) {
         text:                     msg,
         disable_web_page_preview: false,
       }),
+      signal: AbortSignal.timeout(8000),
     })
   } catch (e) {
     console.error('[PaymentSuccess] Telegram notify error:', e.message)
@@ -65,96 +68,113 @@ async function notifyOwner(order, product) {
 }
 
 export default async function handler(req, res) {
-  const { orderId, productId, token: paypalToken } = req.query
+  // PayPal sends: token (PayPal order ID) + PayerID + our custom params
+  const { productId, referenceId, token: paypalOrderId, PayerID } = req.query
 
-  if (!orderId || !paypalToken) {
-    return res.redirect(302, `/marketplace?error=invalid_return`)
+  if (!paypalOrderId || !PayerID) {
+    // Customer cancelled or invalid return
+    return res.redirect(302, `/marketplace?error=payment_cancelled`)
+  }
+
+  if (!productId) {
+    return res.redirect(302, `/marketplace?error=missing_product`)
   }
 
   try {
-    // Get our order from Firestore
-    const orderSnap = await db.collection('shop_orders').doc(orderId).get()
-    if (!orderSnap.exists) {
-      return res.redirect(302, `/marketplace?error=order_not_found`)
-    }
-
-    const order = orderSnap.data()
-
-    // Already captured — idempotent
-    if (order.paymentStatus === 'paid') {
-      return res.redirect(302, `/shop/order-confirmation?orderId=${orderId}`)
-    }
-
-    // Capture the PayPal payment
+    // Step 1: Get PayPal access token
     const accessToken = await getAccessToken()
-    const captureRes  = await fetch(
-      `${PAYPAL_BASE}/v2/checkout/orders/${order.paypalOrderId}/capture`,
+
+    // Step 2: Capture the payment — THIS confirms money moved
+    const captureRes = await fetch(
+      `${PAYPAL_BASE}/v2/checkout/orders/${paypalOrderId}/capture`,
       {
         method:  'POST',
         headers: {
           'Authorization': `Bearer ${accessToken}`,
           'Content-Type':  'application/json',
         },
+        signal: AbortSignal.timeout(15000),
       }
     )
 
     const captureData = await captureRes.json()
 
+    // Step 3: Verify payment was actually completed
     if (captureData.status !== 'COMPLETED') {
-      console.error('[PaymentSuccess] Capture failed:', captureData)
-      await db.collection('shop_orders').doc(orderId).update({
-        paymentStatus: 'failed',
-        captureData,
-        updatedAt: new Date().toISOString(),
-      })
-      return res.redirect(302, `/marketplace/${productId}?error=capture_failed`)
+      console.error('[PaymentSuccess] Capture not completed:', captureData.status)
+      return res.redirect(302, `/marketplace/${productId}?error=payment_not_completed`)
     }
 
-    // Extract customer details from PayPal capture
-    const capture      = captureData.purchase_units?.[0]?.payments?.captures?.[0]
-    const payer        = captureData.payer
-    const shipping     = captureData.purchase_units?.[0]?.shipping
+    // Step 4: Extract confirmed payment details
+    const capture       = captureData.purchase_units?.[0]?.payments?.captures?.[0]
+    const payer         = captureData.payer
+    const shipping      = captureData.purchase_units?.[0]?.shipping
+    const capturedAmount = parseFloat(capture?.amount?.value || '0')
 
     const customerName  = `${payer?.name?.given_name || ''} ${payer?.name?.surname || ''}`.trim()
     const customerEmail = payer?.email_address || ''
     const shippingAddr  = shipping?.address
-      ? `${shipping.address.address_line_1 || ''}, ${shipping.address.admin_area_2 || ''}, ${shipping.address.country_code || ''}`
+      ? [
+          shipping.address.address_line_1,
+          shipping.address.admin_area_2,
+          shipping.address.admin_area_1,
+          shipping.address.country_code,
+        ].filter(Boolean).join(', ')
       : ''
 
-    // Get product details (including source link for fulfillment)
-    const productSnap = await db.collection('shop_approved_products').doc(productId).get()
-    const product     = productSnap.exists ? productSnap.data() : {}
+    // Step 5: Get product details for order record
+    const productSnap = await db
+      .collection('shop_approved_products')
+      .doc(productId)
+      .get()
 
-    // Calculate profit
-    const profitSAR = order.sellingPriceSAR && product._sourcePriceSAR
-      ? (order.sellingPriceSAR - product._sourcePriceSAR).toFixed(2)
+    const product    = productSnap.exists ? productSnap.data() : {}
+    const USD_TO_SAR = 3.75
+    const sarPaid    = Math.round(capturedAmount * USD_TO_SAR)
+    const profitSAR  = product._sourcePriceSAR
+      ? parseFloat((sarPaid - product._sourcePriceSAR).toFixed(2))
       : null
 
-    // Update order as paid
-    const updatedOrder = {
-      ...order,
-      paymentStatus:   'paid',
-      captureId:       capture?.id,
+    // Step 6: Create unique order ID
+    const orderId = `order_${Date.now()}_${productId.substring(0, 8)}`
+
+    // Step 7: SAVE ORDER — only happens after confirmed payment
+    const order = {
+      orderId,
+      productId,
+      productName:       product.name        || 'Product',
+      sellingPriceSAR:   sarPaid,
+      priceUSD:          capturedAmount,
+      profitSAR,
+      paymentMethod:     'paypal',
+      paymentStatus:     'paid',              // ← always 'paid' here
+      paypalOrderId,
+      paypalCaptureId:   capture?.id,
       customerName,
       customerEmail,
-      shippingAddress: shippingAddr,
-      profitSAR:       profitSAR ? parseFloat(profitSAR) : null,
-      paidAt:          new Date().toISOString(),
-      updatedAt:       new Date().toISOString(),
-      fulfillmentStatus: 'pending', // owner needs to buy from source and ship
+      shippingAddress:   shippingAddr,
+      fulfillmentStatus: 'pending',
+      _sourceLink:       product._sourceLink || null,
+      _sourcePriceSAR:   product._sourcePriceSAR || null,
+      paidAt:            new Date().toISOString(),
+      createdAt:         new Date().toISOString(),
     }
 
-    await db.collection('shop_orders').doc(orderId).update(updatedOrder)
+    await db.collection('shop_orders').doc(orderId).set(order)
 
-    // Increment product sales count
-    await db.collection('shop_approved_products').doc(productId).update({
-      sales: (product.sales || 0) + 1,
-    })
+    // Step 8: Increment product sales count
+    if (productSnap.exists) {
+      await db.collection('shop_approved_products').doc(productId).update({
+        sales: (product.sales || 0) + 1,
+      }).catch(() => {})
+    }
 
-    // Notify owner on Telegram
-    await notifyOwner(updatedOrder, product)
+    // Step 9: Notify owner on Telegram
+    await notifyOwner(order, product._sourceLink)
 
-    // Redirect to confirmation page
+    console.log(`[PaymentSuccess] ✅ Order ${orderId} saved — ${sarPaid} SAR`)
+
+    // Step 10: Redirect to confirmation page
     return res.redirect(302, `/shop/order-confirmation?orderId=${orderId}`)
 
   } catch (error) {
