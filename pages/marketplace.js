@@ -1,36 +1,38 @@
 /**
  * HUSIN ESHOP — Public Marketplace at /marketplace
- * FIXED: Removed orderBy to avoid Firestore composite index requirement
- * Reads from shop_approved_products — source never revealed to customers
+ * FIXED: Removed 200 limit cap — shows ALL approved products
+ * Sorted newest first in JavaScript (no Firestore index needed)
  */
 
-import Head       from 'next/head'
-import { db }     from '../lib/firebaseAdmin'
-import Navigation from '../components/navigation'
-import Footer     from '../components/footer'
+import { useState } from 'react'
+import Head         from 'next/head'
+import { db }       from '../lib/firebaseAdmin'
+import Navigation   from '../components/navigation'
+import Footer       from '../components/footer'
 
 const CATEGORIES = [
   { value: 'all',             label: '🌐 All Products' },
+  { value: 'mobiles',         label: '📱 Mobile Phones' },
+  { value: 'laptops',         label: '💻 Laptops & Tech' },
+  { value: 'electronics',     label: '⚡ Electronics' },
   { value: 'home_appliances', label: '🏠 Home Appliances' },
   { value: 'clothes_men',     label: '👔 Men\'s Fashion' },
   { value: 'clothes_women',   label: '👗 Women\'s Fashion' },
   { value: 'clothes_kids',    label: '👶 Kids & Baby' },
   { value: 'jewelry',         label: '💎 Jewelry & Gold' },
-  { value: 'mobiles',         label: '📱 Mobile Phones' },
-  { value: 'laptops',         label: '💻 Laptops & Tech' },
   { value: 'beauty',          label: '💄 Beauty & Care' },
-  { value: 'electronics',     label: '⚡ Electronics' },
   { value: 'sports',          label: '🏋️ Sports & Fitness' },
+  { value: 'toys',            label: '🧸 Toys & Games' },
   { value: 'general',         label: '📦 General' },
 ]
 
 export async function getServerSideProps() {
   try {
-    // Simple query — no orderBy = no composite index needed
+    // FIXED: No limit — fetches ALL live products
+    // Using simple query with no orderBy to avoid index requirement
     const snap = await db
       .collection('shop_approved_products')
       .where('status', '==', 'live')
-      .limit(200)
       .get()
 
     const products = snap.docs.map(doc => {
@@ -46,27 +48,21 @@ export async function getServerSideProps() {
         approvedAt:            d.approvedAt            || '',
         views:                 d.views                 || 0,
         sales:                 d.sales                 || 0,
-        // _sourceLink NEVER sent to client
       }
     })
 
-    // Sort by newest on server side
+    // Sort newest first in JavaScript — no Firestore index needed
     products.sort((a, b) => (b.approvedAt > a.approvedAt ? 1 : -1))
 
-    return { props: { products, error: null } }
+    return { props: { products, total: products.length } }
 
   } catch (e) {
     console.error('[Marketplace] Firestore error:', e.message)
-    return { props: { products: [], error: e.message } }
+    return { props: { products: [], total: 0 } }
   }
 }
 
-export default function MarketplacePage({ products, error }) {
-  const [category, setCategory] = typeof window !== 'undefined'
-    ? [null, null] : [null, null]
-
-  // Client-side state using React
-  const { useState } = require('react')
+export default function MarketplacePage({ products, total }) {
   const [cat,    setCat]    = useState('all')
   const [search, setSearch] = useState('')
   const [sort,   setSort]   = useState('newest')
@@ -83,10 +79,11 @@ export default function MarketplacePage({ products, error }) {
   return (
     <>
       <Head>
-        <title>HUSIN Marketplace — Shop All Products</title>
+        <title>HUSIN Marketplace — {total} Products</title>
         <meta name="description" content="Shop the best products — fashion, electronics, jewelry, home appliances and more delivered to Saudi Arabia." />
-        <meta property="og:title" content="HUSIN Marketplace" />
-        <meta property="og:image" content="https://www.husin.org/logo_logo-200h-200h.png" />
+        <meta property="og:title"       content="HUSIN Marketplace" />
+        <meta property="og:description" content="Shop fashion, electronics, jewelry and more." />
+        <meta property="og:image"       content="https://www.husin.org/logo_logo-200h-200h.png" />
       </Head>
 
       <Navigation />
@@ -110,6 +107,7 @@ export default function MarketplacePage({ products, error }) {
                 onChange={e => setSearch(e.target.value)}
               />
             </div>
+            <p className="mp-total-count">{total} products available</p>
           </div>
         </div>
 
@@ -118,22 +116,23 @@ export default function MarketplacePage({ products, error }) {
           {/* Sidebar */}
           <aside className="mp-sidebar">
             <h3 className="mp-sidebar-title">Categories</h3>
-            {CATEGORIES.map(c => (
-              <button
-                key={c.value}
-                onClick={() => setCat(c.value)}
-                className={`mp-cat-btn ${cat === c.value ? 'mp-cat-active' : ''}`}
-              >
-                <span>{c.label}</span>
-                {cat === c.value && (
-                  <span className="mp-cat-count">
-                    {c.value === 'all'
-                      ? products.length
-                      : products.filter(p => p.category === c.value).length}
-                  </span>
-                )}
-              </button>
-            ))}
+            {CATEGORIES.map(c => {
+              const count = c.value === 'all'
+                ? products.length
+                : products.filter(p => p.category === c.value).length
+              return (
+                <button
+                  key={c.value}
+                  onClick={() => setCat(c.value)}
+                  className={`mp-cat-btn ${cat === c.value ? 'mp-cat-active' : ''}`}
+                >
+                  <span>{c.label}</span>
+                  {count > 0 && (
+                    <span className="mp-cat-count">{count}</span>
+                  )}
+                </button>
+              )
+            })}
           </aside>
 
           {/* Main */}
@@ -143,6 +142,7 @@ export default function MarketplacePage({ products, error }) {
               <span className="mp-count">
                 {filtered.length} product{filtered.length !== 1 ? 's' : ''}
                 {search ? ` for "${search}"` : ''}
+                {cat !== 'all' ? ` in ${CATEGORIES.find(c=>c.value===cat)?.label}` : ''}
               </span>
               <select
                 className="mp-sort"
@@ -155,8 +155,7 @@ export default function MarketplacePage({ products, error }) {
               </select>
             </div>
 
-            {/* Empty state */}
-            {filtered.length === 0 && (
+            {filtered.length === 0 ? (
               <div className="mp-empty">
                 <span className="mp-empty-icon">📦</span>
                 <h3 className="mp-empty-title">
@@ -167,14 +166,8 @@ export default function MarketplacePage({ products, error }) {
                     ? 'Our team is curating the best products for you. Check back soon!'
                     : 'Try a different search or category.'}
                 </p>
-                {error && process.env.NODE_ENV === 'development' && (
-                  <p style={{ color: '#e74c3c', fontSize: '0.75rem' }}>{error}</p>
-                )}
               </div>
-            )}
-
-            {/* Grid */}
-            {filtered.length > 0 && (
+            ) : (
               <div className="mp-grid">
                 {filtered.map(product => (
                   <a
@@ -188,6 +181,7 @@ export default function MarketplacePage({ products, error }) {
                           src={product.image}
                           alt={product.name}
                           className="mp-img"
+                          loading="lazy"
                           onError={e => { e.target.style.display = 'none' }}
                         />
                       ) : (
@@ -223,18 +217,19 @@ export default function MarketplacePage({ products, error }) {
         .mp-hero-inner { max-width: 700px; margin: 0 auto; }
         .mp-hero-title { color: #fff; font-size: 2.2rem; font-family: var(--font-family-heading); font-weight: 700; margin: 0 0 12px; }
         .mp-hero-sub { color: rgba(255,255,255,0.55); font-size: 1rem; margin: 0 0 28px; line-height: 1.6; }
-        .mp-search-wrap { position: relative; max-width: 500px; margin: 0 auto; display: flex; align-items: center; }
+        .mp-search-wrap { position: relative; max-width: 500px; margin: 0 auto 12px; display: flex; align-items: center; }
         .mp-search-icon { position: absolute; left: 16px; font-size: 1.1rem; }
         .mp-search { width: 100%; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); border-radius: 12px; padding: 14px 20px 14px 44px; color: #fff; font-size: 1rem; outline: none; box-sizing: border-box; font-family: inherit; }
         .mp-search::placeholder { color: rgba(255,255,255,0.35); }
         .mp-search:focus { border-color: var(--color-accent); }
+        .mp-total-count { color: rgba(255,255,255,0.35); font-size: 0.8rem; margin: 0; }
         .mp-body { display: flex; max-width: 1400px; margin: 0 auto; padding: 32px; gap: 28px; }
         .mp-sidebar { width: 220px; flex-shrink: 0; }
         .mp-sidebar-title { color: rgba(255,255,255,0.5); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em; margin: 0 0 12px; }
         .mp-cat-btn { display: flex; align-items: center; justify-content: space-between; width: 100%; background: transparent; border: none; color: rgba(255,255,255,0.6); padding: 10px 12px; border-radius: 8px; cursor: pointer; font-size: 0.85rem; text-align: left; font-family: inherit; margin-bottom: 2px; transition: all 0.2s; }
         .mp-cat-btn:hover { background: rgba(255,255,255,0.05); color: #fff; }
         .mp-cat-active { background: rgba(0,217,255,0.1) !important; color: #00d9ff !important; }
-        .mp-cat-count { background: rgba(0,217,255,0.2); color: #00d9ff; padding: 2px 7px; border-radius: 20px; font-size: 0.7rem; }
+        .mp-cat-count { background: rgba(0,217,255,0.15); color: #00d9ff; padding: 2px 7px; border-radius: 20px; font-size: 0.7rem; flex-shrink: 0; }
         .mp-main { flex: 1; min-width: 0; }
         .mp-toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
         .mp-count { color: rgba(255,255,255,0.45); font-size: 0.85rem; }
@@ -265,6 +260,7 @@ export default function MarketplacePage({ products, error }) {
           .mp-hero { padding: 40px 20px; }
           .mp-hero-title { font-size: 1.5rem; }
           .mp-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+          .mp-card-img { height: 150px; }
         }
       `}</style>
     </>
