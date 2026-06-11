@@ -1,76 +1,72 @@
 /**
  * HUSIN ESHOP — /shop (Owner Dashboard)
- * Updated with:
- * ✅ Category selection buttons — choose what to search before launching
- * ✅ Quality filter rules visible per category
- * ✅ Search stats — accepted vs rejected count
- * ✅ Session history with product previews
- * ✅ All existing approve/reject workflow preserved
+ * FREE PLAN compatible — drives trigger-worker.js in a polling loop
+ * Each worker call processes 1 query (~5s), dashboard calls next until done
  */
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import Head from 'next/head'
 
 const CATEGORIES = [
   { key: 'all',             label: '🌐 All Categories',    desc: 'Run all categories at once' },
   { key: 'clothes_men',     label: "👔 Men's Wear",        desc: 'Nike, Adidas, polo shirts, jeans, jackets' },
   { key: 'clothes_women',   label: "👗 Women's Wear",      desc: 'Handbags, dresses, heels, Coach, MK' },
-  { key: 'electronics',     label: '⚡ Electronics',        desc: 'Apple, Samsung, Sony — FULL SPECS REQUIRED' },
-  { key: 'mobiles',         label: '📱 Mobiles',            desc: 'iPhones, Samsung Galaxy — sealed new only' },
-  { key: 'laptops',         label: '💻 Laptops',            desc: 'MacBook, Dell, HP — full specs required' },
+  { key: 'electronics',     label: '⚡ Electronics',        desc: 'Apple, Samsung, Sony — full specs' },
+  { key: 'mobiles',         label: '📱 Mobiles',            desc: 'iPhones, Samsung Galaxy — new sealed' },
+  { key: 'laptops',         label: '💻 Laptops',            desc: 'MacBook, Dell, HP — new sealed' },
   { key: 'jewelry',         label: '💎 Jewelry',            desc: 'Gold, diamond, Pandora, Cartier' },
   { key: 'beauty',          label: '💄 Beauty',             desc: 'Perfumes, skincare, Charlotte Tilbury' },
   { key: 'home_appliances', label: '🏠 Home Appliances',   desc: 'Dyson, KitchenAid, Nespresso' },
   { key: 'sports',          label: '🏋️ Sports',            desc: 'Nike, Adidas, Garmin, Fitbit' },
-  { key: 'toys',            label: '🧸 Toys',               desc: 'LEGO, Hot Wheels, Barbie — sealed new' },
+  { key: 'toys',            label: '🧸 Toys',               desc: 'LEGO, Hot Wheels — sealed new' },
 ]
 
 const QUALITY_RULES = {
-  all:             { minSpecs: 4,  images: 2, condition: 'New only',        strict: false },
-  clothes_men:     { minSpecs: 5,  images: 2, condition: 'New / New with tags', strict: false },
-  clothes_women:   { minSpecs: 5,  images: 2, condition: 'New / New with tags', strict: false },
-  electronics:     { minSpecs: 8,  images: 2, condition: '100% New sealed', strict: true  },
-  mobiles:         { minSpecs: 8,  images: 2, condition: '100% New sealed', strict: true  },
-  laptops:         { minSpecs: 8,  images: 2, condition: '100% New sealed', strict: true  },
-  jewelry:         { minSpecs: 5,  images: 2, condition: 'New only',        strict: false },
-  beauty:          { minSpecs: 4,  images: 2, condition: 'New sealed',      strict: false },
-  home_appliances: { minSpecs: 5,  images: 2, condition: '100% New',       strict: false },
-  sports:          { minSpecs: 5,  images: 2, condition: 'New / New with box', strict: false },
-  toys:            { minSpecs: 4,  images: 2, condition: 'New sealed',      strict: false },
+  all:             { minSpecs: 3, images: 1, condition: 'New only',            strict: false },
+  clothes_men:     { minSpecs: 4, images: 1, condition: 'New / New with tags', strict: false },
+  clothes_women:   { minSpecs: 4, images: 1, condition: 'New / New with tags', strict: false },
+  electronics:     { minSpecs: 5, images: 1, condition: '100% New sealed',     strict: true  },
+  mobiles:         { minSpecs: 5, images: 1, condition: '100% New sealed',     strict: true  },
+  laptops:         { minSpecs: 5, images: 1, condition: '100% New sealed',     strict: true  },
+  jewelry:         { minSpecs: 3, images: 1, condition: 'New only',            strict: false },
+  beauty:          { minSpecs: 3, images: 1, condition: 'New sealed',          strict: false },
+  home_appliances: { minSpecs: 3, images: 1, condition: '100% New',            strict: false },
+  sports:          { minSpecs: 3, images: 1, condition: 'New / New with box',  strict: false },
+  toys:            { minSpecs: 3, images: 1, condition: 'New sealed',          strict: false },
 }
 
 export default function OwnerDashboard() {
-  // Auth
-  const [authed,     setAuthed]     = useState(false)
-  const [password,   setPassword]   = useState('')
-  const [authErr,    setAuthErr]    = useState('')
-  const [token,      setToken]      = useState('')
+  const [authed,       setAuthed]       = useState(false)
+  const [password,     setPassword]     = useState('')
+  const [authErr,      setAuthErr]      = useState('')
+  const [token,        setToken]        = useState('')
 
-  // Dashboard state
-  const [selectedCat, setSelectedCat] = useState('all')
-  const [searching,   setSearching]   = useState(false)
-  const [searchMsg,   setSearchMsg]   = useState('')
-  const [searchErr,   setSearchErr]   = useState('')
-  const [stats,       setStats]       = useState(null)
-  const [sessions,    setSessions]    = useState([])
-  const [sessionProds,setSessionProds]= useState([])
-  const [activeSession, setActiveSession] = useState(null)
-  const [loadingProds, setLoadingProds]   = useState(false)
+  const [selectedCat,  setSelectedCat]  = useState('all')
+  const [searching,    setSearching]    = useState(false)
+  const [jobId,        setJobId]        = useState(null)
+  const [progress,     setProgress]     = useState(null) // { completed, total, accepted, rejected, currentQuery }
+  const [searchLog,    setSearchLog]    = useState([])
+  const [searchDone,   setSearchDone]   = useState(false)
+  const [searchErr,    setSearchErr]    = useState('')
 
-  // Load stats on auth
+  const [stats,        setStats]        = useState(null)
+  const [sessions,     setSessions]     = useState([])
+  const [sessionProds, setSessionProds] = useState([])
+  const [activeSession,setActiveSession]= useState(null)
+  const [loadingProds, setLoadingProds] = useState(false)
+
+  const workerRef    = useRef(null)
+  const activeJobRef = useRef(null)
+
+  // Restore token
   useEffect(() => {
-    if (authed && token) {
-      loadStats()
-      loadSessions()
-    }
+    const saved = localStorage.getItem('shop_token')
+    if (saved) { setToken(saved); setAuthed(true) }
+  }, [])
+
+  useEffect(() => {
+    if (authed && token) { loadStats(); loadSessions() }
   }, [authed, token])
-
-  // Auto-refresh stats while searching
-  useEffect(() => {
-    if (!searching) return
-    const iv = setInterval(loadStats, 5000)
-    return () => clearInterval(iv)
-  }, [searching])
 
   async function handleLogin(e) {
     e.preventDefault()
@@ -90,15 +86,13 @@ export default function OwnerDashboard() {
         setAuthErr('Wrong password.')
       }
     } catch {
-      setAuthErr('Login failed. Try again.')
+      setAuthErr('Login failed.')
     }
   }
 
   async function loadStats() {
     try {
-      const res  = await fetch('/api/shop/stats', {
-        headers: { 'x-shop-token': token }
-      })
+      const res  = await fetch('/api/shop/stats', { headers: { 'x-shop-token': token } })
       const data = await res.json()
       if (data.stats) setStats(data.stats)
     } catch {}
@@ -106,20 +100,14 @@ export default function OwnerDashboard() {
 
   async function loadSessions() {
     try {
-      const res  = await fetch('/api/shop/sessions', {
-        headers: { 'x-shop-token': token }
-      })
+      const res  = await fetch('/api/shop/sessions', { headers: { 'x-shop-token': token } })
       const data = await res.json()
-      if (data.sessions) setSessions(data.sessions.slice(0, 10))
+      if (data.sessions) setSessions(data.sessions.slice(0, 8))
     } catch {}
   }
 
   async function loadSessionProducts(sessionId) {
-    if (activeSession === sessionId) {
-      setActiveSession(null)
-      setSessionProds([])
-      return
-    }
+    if (activeSession === sessionId) { setActiveSession(null); setSessionProds([]); return }
     setActiveSession(sessionId)
     setLoadingProds(true)
     try {
@@ -130,39 +118,6 @@ export default function OwnerDashboard() {
       setSessionProds(data.products || [])
     } catch {}
     setLoadingProds(false)
-  }
-
-  async function handleSearch() {
-    if (searching) return
-    setSearching(true)
-    setSearchMsg('')
-    setSearchErr('')
-
-    try {
-      const res  = await fetch('/api/shop/trigger', {
-        method:  'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-shop-token': token,
-        },
-        body: JSON.stringify({ category: selectedCat, maxProducts: 60 }),
-      })
-      const data = await res.json()
-
-      if (data.success) {
-        const catLabel = CATEGORIES.find(c => c.key === selectedCat)?.label || selectedCat
-        setSearchMsg(`✅ Search launched for ${catLabel}. Products will arrive in Telegram shortly.`)
-        // Reload sessions after 10s
-        setTimeout(() => { loadSessions(); loadStats() }, 10000)
-        setTimeout(() => { setSearching(false); loadStats(); loadSessions() }, 90000)
-      } else {
-        setSearchErr(data.error || 'Search failed')
-        setSearching(false)
-      }
-    } catch (err) {
-      setSearchErr(err.message)
-      setSearching(false)
-    }
   }
 
   async function handleDecide(productId, decision) {
@@ -177,16 +132,115 @@ export default function OwnerDashboard() {
     } catch {}
   }
 
-  // Restore token from localStorage
-  useEffect(() => {
-    const saved = localStorage.getItem('shop_token')
-    if (saved) { setToken(saved); setAuthed(true) }
-  }, [])
+  // ── WORKER LOOP ─────────────────────────────────────────────────────────────
+  // Calls trigger-worker repeatedly until job is done
+  // Each call = 1 query, waits 1.5s between calls to avoid hammering
+  const runWorker = useCallback(async (jid) => {
+    if (!jid) return
+
+    try {
+      const res  = await fetch('/api/shop/trigger-worker', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'x-shop-token': token },
+        body:    JSON.stringify({ jobId: jid }),
+      })
+      const data = await res.json()
+
+      if (data.error) {
+        setSearchErr(`Worker error: ${data.error}`)
+        setSearching(false)
+        return
+      }
+
+      // Update progress
+      setProgress({
+        completed:    data.completedTasks  || 0,
+        total:        data.totalTasks      || 0,
+        accepted:     data.accepted        || 0,
+        rejected:     data.rejected        || 0,
+        currentQuery: data.currentQuery    || '',
+      })
+
+      // Add to log
+      if (data.message) {
+        setSearchLog(prev => [data.message, ...prev].slice(0, 20))
+      }
+
+      if (data.done) {
+        // Job complete
+        setSearching(false)
+        setSearchDone(true)
+        setProgress(null)
+        loadStats()
+        loadSessions()
+      } else {
+        // Schedule next worker call after 1.5s pause
+        workerRef.current = setTimeout(() => {
+          if (activeJobRef.current === jid) runWorker(jid)
+        }, 1500)
+      }
+    } catch (err) {
+      // Retry on network error after 3s
+      workerRef.current = setTimeout(() => {
+        if (activeJobRef.current === jid) runWorker(jid)
+      }, 3000)
+    }
+  }, [token])
+
+  async function handleSearch() {
+    if (searching) return
+    setSearching(true)
+    setSearchDone(false)
+    setSearchErr('')
+    setSearchLog([])
+    setProgress(null)
+
+    // Clear any existing worker
+    if (workerRef.current) clearTimeout(workerRef.current)
+
+    try {
+      // Step 1: Create job
+      const res  = await fetch('/api/shop/trigger', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'x-shop-token': token },
+        body:    JSON.stringify({ category: selectedCat }),
+      })
+      const data = await res.json()
+
+      if (!data.success || !data.jobId) {
+        setSearchErr(data.error || 'Failed to create search job')
+        setSearching(false)
+        return
+      }
+
+      setJobId(data.jobId)
+      activeJobRef.current = data.jobId
+      setProgress({ completed: 0, total: data.totalTasks, accepted: 0, rejected: 0, currentQuery: '' })
+      setSearchLog([`Job created — ${data.totalTasks} queries to process...`])
+
+      // Step 2: Start worker loop
+      runWorker(data.jobId)
+
+    } catch (err) {
+      setSearchErr(err.message)
+      setSearching(false)
+    }
+  }
+
+  function handleStop() {
+    if (workerRef.current) clearTimeout(workerRef.current)
+    activeJobRef.current = null
+    setSearching(false)
+    setSearchLog(prev => ['⏹ Search stopped by owner.', ...prev])
+  }
 
   const selectedRules = QUALITY_RULES[selectedCat] || QUALITY_RULES.all
   const selectedInfo  = CATEGORIES.find(c => c.key === selectedCat)
+  const progressPct   = progress && progress.total > 0
+    ? Math.round((progress.completed / progress.total) * 100)
+    : 0
 
-  // ── LOGIN PAGE ─────────────────────────────────────────────────────────────
+  // ── LOGIN ──────────────────────────────────────────────────────────────────
   if (!authed) return (
     <>
       <Head><title>HUSIN Owner Dashboard</title></Head>
@@ -197,14 +251,9 @@ export default function OwnerDashboard() {
           <h1 style={S.loginTitle}>Owner Dashboard</h1>
           <p style={S.loginSub}>HUSIN Nexus · Private Access</p>
           <form onSubmit={handleLogin} style={S.loginForm}>
-            <input
-              type="password"
-              style={S.loginInput}
+            <input type="password" style={S.loginInput}
               placeholder="Enter access password"
-              value={password}
-              onChange={e => setPassword(e.target.value)}
-              autoFocus
-            />
+              value={password} onChange={e=>setPassword(e.target.value)} autoFocus />
             {authErr && <p style={S.loginErr}>{authErr}</p>}
             <button type="submit" style={S.loginBtn}>Enter Dashboard →</button>
           </form>
@@ -217,8 +266,8 @@ export default function OwnerDashboard() {
   return (
     <>
       <Head><title>Owner Dashboard — HUSIN</title></Head>
-
       <div style={S.page}>
+
         {/* Top bar */}
         <div style={S.topBar}>
           <div style={S.topBarLeft}>
@@ -238,43 +287,39 @@ export default function OwnerDashboard() {
 
         <div style={S.layout}>
 
-          {/* ── STATS ROW ── */}
+          {/* Stats */}
           {stats && (
             <div style={S.statsRow}>
               {[
-                { label:'Live Products',  val: stats.live    || 0, color:'#2ecc71' },
-                { label:'Pending Review', val: stats.pending || 0, color:'#f39c12' },
-                { label:'Rejected',       val: stats.rejected|| 0, color:'#e74c3c' },
-                { label:'Total Orders',   val: stats.orders  || 0, color:'#00d9ff' },
-              ].map((s,i) => (
+                { label:'Live Products',  val:stats.live    ||0, color:'#2ecc71' },
+                { label:'Pending Review', val:stats.pending ||0, color:'#f39c12' },
+                { label:'Rejected',       val:stats.rejected||0, color:'#e74c3c' },
+                { label:'Total Orders',   val:stats.orders  ||0, color:'#00d9ff' },
+              ].map((s,i)=>(
                 <div key={i} style={S.statCard}>
-                  <span style={{...S.statVal, color:s.color}}>{s.val.toLocaleString()}</span>
+                  <span style={{...S.statVal,color:s.color}}>{s.val.toLocaleString()}</span>
                   <span style={S.statLabel}>{s.label}</span>
                 </div>
               ))}
             </div>
           )}
 
-          {/* ── SEARCH PANEL ── */}
-          <div style={S.searchPanel}>
-            <h2 style={S.sectionTitle}>⚡ Launch Product Search</h2>
+          {/* Search Panel */}
+          <div style={S.panel}>
+            <h2 style={S.panelTitle}>⚡ Launch Product Search</h2>
 
-            {/* Step 1: Choose category */}
+            {/* Step 1 — Category */}
             <div style={S.step}>
               <div style={S.stepHead}>
                 <span style={S.stepNum}>1</span>
-                <span style={S.stepLabel2}>Select Category to Search</span>
+                <span style={S.stepLbl}>Select Category</span>
               </div>
               <div style={S.catGrid}>
-                {CATEGORIES.map(cat => (
-                  <button
-                    key={cat.key}
-                    style={{
-                      ...S.catBtn,
-                      ...(selectedCat === cat.key ? S.catBtnActive : {}),
-                    }}
-                    onClick={() => setSelectedCat(cat.key)}
-                  >
+                {CATEGORIES.map(cat=>(
+                  <button key={cat.key}
+                    style={{...S.catBtn,...(selectedCat===cat.key?S.catBtnOn:{})}}
+                    onClick={()=>setSelectedCat(cat.key)}
+                    disabled={searching}>
                     <span style={S.catBtnLabel}>{cat.label}</span>
                     <span style={S.catBtnDesc}>{cat.desc}</span>
                   </button>
@@ -282,192 +327,201 @@ export default function OwnerDashboard() {
               </div>
             </div>
 
-            {/* Step 2: Quality rules preview */}
+            {/* Step 2 — Quality rules */}
             <div style={S.step}>
               <div style={S.stepHead}>
                 <span style={S.stepNum}>2</span>
-                <span style={S.stepLabel2}>
-                  Active Quality Rules for: <strong style={{color:'#00d9ff'}}>{selectedInfo?.label}</strong>
+                <span style={S.stepLbl}>
+                  Quality Rules for: <strong style={{color:'#00d9ff'}}>{selectedInfo?.label}</strong>
                 </span>
               </div>
-              <div style={S.rulesGrid}>
-                <div style={S.ruleCard}>
-                  <span style={S.ruleIcon}>🔍</span>
-                  <div>
-                    <span style={S.ruleTitle}>Condition</span>
-                    <span style={{
-                      ...S.ruleVal,
-                      color: selectedRules.strict ? '#e74c3c' : '#2ecc71'
-                    }}>
-                      {selectedRules.condition}
-                    </span>
+              <div style={S.rulesRow}>
+                {[
+                  { icon:'🔍', title:'Condition',    val:selectedRules.condition, color: selectedRules.strict?'#e74c3c':'#2ecc71' },
+                  { icon:'📋', title:'Min Specs',    val:`${selectedRules.minSpecs}+ fields`, color:'rgba(255,255,255,0.7)' },
+                  { icon:'🖼️', title:'Images',       val:`${selectedRules.images}+ photos`,  color:'rgba(255,255,255,0.7)' },
+                  { icon:selectedRules.strict?'🔒':'✅', title:'Mode', val:selectedRules.strict?'STRICT':'Standard', color:selectedRules.strict?'#e74c3c':'#f39c12' },
+                ].map((r,i)=>(
+                  <div key={i} style={S.ruleCard}>
+                    <span style={S.ruleIcon}>{r.icon}</span>
+                    <div>
+                      <span style={S.ruleTitle}>{r.title}</span>
+                      <span style={{...S.ruleVal,color:r.color}}>{r.val}</span>
+                    </div>
                   </div>
-                </div>
-                <div style={S.ruleCard}>
-                  <span style={S.ruleIcon}>📋</span>
-                  <div>
-                    <span style={S.ruleTitle}>Min Specifications</span>
-                    <span style={S.ruleVal}>{selectedRules.minSpecs}+ required fields</span>
-                  </div>
-                </div>
-                <div style={S.ruleCard}>
-                  <span style={S.ruleIcon}>🖼️</span>
-                  <div>
-                    <span style={S.ruleTitle}>Images Required</span>
-                    <span style={S.ruleVal}>{selectedRules.images}+ product images</span>
-                  </div>
-                </div>
-                <div style={S.ruleCard}>
-                  <span style={S.ruleIcon}>{selectedRules.strict ? '🔒' : '✅'}</span>
-                  <div>
-                    <span style={S.ruleTitle}>Specs Mode</span>
-                    <span style={{
-                      ...S.ruleVal,
-                      color: selectedRules.strict ? '#e74c3c' : '#f39c12'
-                    }}>
-                      {selectedRules.strict ? 'STRICT — All specs required' : 'Standard quality'}
-                    </span>
-                  </div>
-                </div>
+                ))}
               </div>
               {selectedRules.strict && (
-                <div style={S.strictWarning}>
-                  ⚠️ <strong>Strict Mode:</strong> Products without complete technical specifications
-                  will be automatically rejected. This ensures only fully documented items enter your store.
+                <div style={S.strictWarn}>
+                  ⚠️ Strict mode — products without full specifications are automatically rejected
                 </div>
               )}
             </div>
 
-            {/* Step 3: Launch */}
+            {/* Step 3 — Launch */}
             <div style={S.step}>
               <div style={S.stepHead}>
                 <span style={S.stepNum}>3</span>
-                <span style={S.stepLabel2}>Launch Search</span>
+                <span style={S.stepLbl}>Launch</span>
               </div>
-              <button
-                style={{
-                  ...S.launchBtn,
-                  ...(searching ? S.launchBtnBusy : {}),
-                }}
-                onClick={handleSearch}
-                disabled={searching}
-              >
-                {searching
-                  ? <><span style={S.spinner} /> Searching {selectedInfo?.label}...</>
-                  : <>⚡ Start Search — {selectedInfo?.label}</>
-                }
-              </button>
+              <div style={{display:'flex',gap:10,flexWrap:'wrap'}}>
+                <button
+                  style={{...S.launchBtn,...(searching?S.launchBtnBusy:{})}}
+                  onClick={handleSearch} disabled={searching}>
+                  {searching
+                    ? <><span style={S.spinner}/>Searching {selectedInfo?.label}...</>
+                    : <>⚡ Start Search — {selectedInfo?.label}</>
+                  }
+                </button>
+                {searching && (
+                  <button style={S.stopBtn} onClick={handleStop}>⏹ Stop</button>
+                )}
+              </div>
               <p style={S.launchNote}>
-                Products matching your rules will be sent to Telegram for approval.
-                Estimated time: 60–90 seconds per category.
+                Products matching your rules will be sent to Telegram @Husin_Intel_bot for approval.
               </p>
             </div>
 
-            {/* Messages */}
-            {searchMsg && <div style={S.msgSuccess}>{searchMsg}</div>}
-            {searchErr && <div style={S.msgError}>❌ {searchErr}</div>}
+            {/* Progress bar */}
+            {searching && progress && (
+              <div style={S.progressWrap}>
+                <div style={S.progressBar}>
+                  <div style={{...S.progressFill, width:`${progressPct}%`}} />
+                </div>
+                <div style={S.progressInfo}>
+                  <span style={S.progressText}>
+                    Query {progress.completed}/{progress.total} · {progressPct}%
+                  </span>
+                  <span style={S.progressText}>
+                    ✅ {progress.accepted} found · ❌ {progress.rejected} rejected
+                  </span>
+                </div>
+                {progress.currentQuery && (
+                  <p style={S.currentQuery}>🔍 Searching: "{progress.currentQuery}"</p>
+                )}
+              </div>
+            )}
+
+            {/* Done message */}
+            {searchDone && !searching && (
+              <div style={S.msgSuccess}>
+                ✅ Search complete! Check your Telegram @Husin_Intel_bot for products to approve.
+              </div>
+            )}
+
+            {/* Error */}
+            {searchErr && (
+              <div style={S.msgError}>❌ {searchErr}</div>
+            )}
+
+            {/* Live log */}
+            {searchLog.length > 0 && (
+              <div style={S.logBox}>
+                <p style={S.logTitle}>Live Search Log</p>
+                {searchLog.map((line,i)=>(
+                  <p key={i} style={{...S.logLine, opacity: i===0?1:0.5-i*0.03}}>
+                    {i===0?'▶ ':' '}{line}
+                  </p>
+                ))}
+              </div>
+            )}
           </div>
 
-          {/* ── SESSION HISTORY ── */}
-          <div style={S.sessionsPanel}>
-            <div style={S.sessionsPanelHead}>
-              <h2 style={S.sectionTitle}>📁 Search Sessions</h2>
+          {/* Sessions */}
+          <div style={S.panel}>
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:18}}>
+              <h2 style={{...S.panelTitle,margin:0}}>📁 Search Sessions</h2>
               <button style={S.refreshBtn} onClick={()=>{loadSessions();loadStats()}}>↻ Refresh</button>
             </div>
 
             {sessions.length === 0 ? (
               <p style={S.emptyNote}>No sessions yet. Launch a search above.</p>
             ) : (
-              <div style={S.sessionList}>
-                {sessions.map((session, i) => (
+              <div style={{display:'flex',flexDirection:'column',gap:10}}>
+                {sessions.map((session,i)=>(
                   <div key={i} style={S.sessionCard}>
                     <div style={S.sessionHead}
-                      onClick={() => loadSessionProducts(session.sessionId)}>
-                      <div style={S.sessionInfo}>
+                      onClick={()=>loadSessionProducts(session.sessionId||session.jobId)}>
+                      <div>
                         <span style={S.sessionCats}>
-                          {(session.categories || ['all']).join(', ')}
+                          {(session.categories||[session.selectedCategory]||['all']).join(', ')}
                         </span>
                         <span style={S.sessionTime}>
-                          {new Date(session.startedAt).toLocaleString('en-SA')}
+                          {new Date(session.startedAt||session.createdAt).toLocaleString('en-SA')}
                         </span>
                       </div>
-                      <div style={S.sessionStats}>
-                        <span style={{...S.sessionStat, color:'#2ecc71'}}>
-                          ✅ {session.accepted || 0}
+                      <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+                        <span style={{color:'#2ecc71',fontSize:'0.8rem',fontWeight:700}}>
+                          ✅ {session.accepted||0}
                         </span>
-                        <span style={{...S.sessionStat, color:'#e74c3c'}}>
-                          ❌ {session.rejected || 0}
+                        <span style={{color:'#e74c3c',fontSize:'0.8rem',fontWeight:700}}>
+                          ❌ {session.rejected||0}
                         </span>
                         <span style={{
-                          ...S.sessionStatus,
-                          background: session.status === 'completed'
-                            ? 'rgba(46,204,113,0.1)' : 'rgba(243,156,18,0.1)',
-                          color: session.status === 'completed' ? '#2ecc71' : '#f39c12',
-                          border: `1px solid ${session.status === 'completed'
-                            ? 'rgba(46,204,113,0.2)' : 'rgba(243,156,18,0.2)'}`,
+                          ...S.sessionStatusBadge,
+                          background: session.status==='completed'?'rgba(46,204,113,0.1)':'rgba(243,156,18,0.1)',
+                          color:      session.status==='completed'?'#2ecc71':'#f39c12',
+                          border:     `1px solid ${session.status==='completed'?'rgba(46,204,113,0.2)':'rgba(243,156,18,0.2)'}`,
                         }}>
-                          {session.status || 'running'}
+                          {session.status||'running'}
                         </span>
-                        <span style={S.sessionToggle}>
-                          {activeSession === session.sessionId ? '▲' : '▼'}
+                        <span style={{color:'rgba(255,255,255,0.3)',fontSize:'0.75rem'}}>
+                          {activeSession===(session.sessionId||session.jobId)?'▲':'▼'}
                         </span>
                       </div>
                     </div>
 
-                    {/* Session products */}
-                    {activeSession === session.sessionId && (
-                      <div style={S.sessionProdsWrap}>
+                    {activeSession===(session.sessionId||session.jobId) && (
+                      <div style={{borderTop:'1px solid rgba(255,255,255,0.06)',padding:16}}>
                         {loadingProds ? (
-                          <p style={S.emptyNote}>Loading products...</p>
-                        ) : sessionProds.length === 0 ? (
+                          <p style={S.emptyNote}>Loading...</p>
+                        ) : sessionProds.length===0 ? (
                           <p style={S.emptyNote}>No products in this session.</p>
                         ) : (
                           <div style={S.prodGrid}>
-                            {sessionProds.map((prod, j) => (
+                            {sessionProds.map((prod,j)=>(
                               <div key={j} style={S.prodCard}>
                                 <div style={S.prodImgWrap}>
-                                  {prod.image ? (
-                                    <img src={prod.image} alt={prod.name} style={S.prodImg}
-                                      onError={e=>{e.target.style.display='none'}} />
-                                  ) : (
-                                    <div style={S.prodImgPh}>📦</div>
-                                  )}
+                                  {prod.image
+                                    ? <img src={prod.image} alt={prod.name} style={S.prodImg}
+                                        onError={e=>{e.target.style.display='none'}}/>
+                                    : <div style={S.prodImgPh}>📦</div>
+                                  }
                                 </div>
                                 <div style={S.prodInfo}>
-                                  <p style={S.prodName}>{prod.name?.substring(0,60)}</p>
+                                  <p style={S.prodName}>{prod.name?.substring(0,55)}</p>
                                   <div style={S.prodMeta}>
-                                    <span style={{...S.prodBadge, background:'rgba(200,164,109,0.1)', color:'#c8a46d'}}>
+                                    <span style={{...S.badge,background:'rgba(200,164,109,0.1)',color:'#c8a46d'}}>
                                       {prod.sellingPriceSAR?.toLocaleString()} SAR
                                     </span>
-                                    <span style={{...S.prodBadge, background:'rgba(255,255,255,0.05)', color:'rgba(255,255,255,0.5)'}}>
+                                    <span style={{...S.badge,background:'rgba(255,255,255,0.05)',color:'rgba(255,255,255,0.45)'}}>
                                       {prod.category}
                                     </span>
                                     {prod.qualityScore && (
-                                      <span style={{...S.prodBadge,
-                                        background: prod.qualityScore >= 70
-                                          ? 'rgba(46,204,113,0.1)' : 'rgba(243,156,18,0.1)',
-                                        color: prod.qualityScore >= 70 ? '#2ecc71' : '#f39c12'
+                                      <span style={{
+                                        ...S.badge,
+                                        background:prod.qualityScore>=70?'rgba(46,204,113,0.1)':'rgba(243,156,18,0.1)',
+                                        color:prod.qualityScore>=70?'#2ecc71':'#f39c12',
                                       }}>
                                         ⭐ {prod.qualityScore}
                                       </span>
                                     )}
                                   </div>
-                                  {/* Approve / Reject from dashboard */}
-                                  {prod.status === 'pending' && (
-                                    <div style={S.prodActions}>
+                                  {prod.status==='pending' && (
+                                    <div style={{display:'flex',gap:8,marginTop:6}}>
                                       <button style={S.approveBtn}
-                                        onClick={() => handleDecide(prod.id, 'approve')}>
+                                        onClick={()=>handleDecide(prod.id,'approve')}>
                                         ✅ Approve
                                       </button>
                                       <button style={S.rejectBtn}
-                                        onClick={() => handleDecide(prod.id, 'reject')}>
+                                        onClick={()=>handleDecide(prod.id,'reject')}>
                                         ❌ Reject
                                       </button>
                                     </div>
                                   )}
-                                  {prod.status === 'live' && (
-                                    <span style={{...S.prodBadge, background:'rgba(46,204,113,0.1)', color:'#2ecc71', marginTop:6, display:'inline-block'}}>
-                                      ✅ Live on marketplace
+                                  {prod.status==='live' && (
+                                    <span style={{...S.badge,background:'rgba(46,204,113,0.1)',color:'#2ecc71',marginTop:6,display:'inline-block'}}>
+                                      ✅ Live
                                     </span>
                                   )}
                                 </div>
@@ -482,121 +536,110 @@ export default function OwnerDashboard() {
               </div>
             )}
           </div>
-
         </div>
       </div>
 
       <style>{`
         @keyframes dashSpin { to { transform:rotate(360deg); } }
-        input:focus { outline:none; }
-        button:focus { outline:none; }
+        @keyframes progressPulse {
+          0%,100% { opacity:1; } 50% { opacity:0.7; }
+        }
         * { box-sizing:border-box; }
-        ::-webkit-scrollbar { width:5px; height:5px; }
-        ::-webkit-scrollbar-track { background:rgba(255,255,255,0.03); }
-        ::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.1); border-radius:3px; }
+        input:focus,button:focus { outline:none; }
+        input::placeholder { color:rgba(255,255,255,0.25); }
+        ::-webkit-scrollbar { width:4px; }
+        ::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.1); border-radius:2px; }
       `}</style>
     </>
   )
 }
 
-// ── Inline styles ─────────────────────────────────────────────────────────────
 const S = {
-  // Login
-  loginPage:    { background:'#050608', minHeight:'100vh', display:'flex', alignItems:'center', justifyContent:'center', padding:'20px', fontFamily:'Roboto,system-ui,sans-serif' },
-  loginCard:    { background:'#0f1117', border:'1px solid rgba(255,255,255,0.08)', borderRadius:20, padding:'48px 40px', maxWidth:420, width:'100%', textAlign:'center' },
-  loginLogo:    { height:52, width:'auto', objectFit:'contain', marginBottom:20 },
-  loginTitle:   { color:'#fff', fontSize:'1.5rem', fontWeight:700, margin:'0 0 6px' },
-  loginSub:     { color:'rgba(255,255,255,0.35)', fontSize:'0.85rem', margin:'0 0 28px' },
-  loginForm:    { display:'flex', flexDirection:'column', gap:12 },
-  loginInput:   { background:'rgba(255,255,255,0.05)', border:'1px solid rgba(255,255,255,0.1)', borderRadius:10, padding:'13px 16px', color:'#fff', fontSize:'0.95rem', fontFamily:'inherit' },
-  loginErr:     { color:'#e74c3c', fontSize:'0.82rem', margin:0 },
-  loginBtn:     { background:'linear-gradient(135deg,#00d9ff,#0099bb)', color:'#000', border:'none', borderRadius:10, padding:'14px', fontSize:'0.95rem', fontWeight:700, cursor:'pointer', fontFamily:'inherit' },
+  loginPage:   { background:'#050608',minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',padding:20,fontFamily:'Roboto,system-ui,sans-serif' },
+  loginCard:   { background:'#0f1117',border:'1px solid rgba(255,255,255,0.08)',borderRadius:20,padding:'48px 40px',maxWidth:420,width:'100%',textAlign:'center' },
+  loginLogo:   { height:52,width:'auto',objectFit:'contain',marginBottom:20 },
+  loginTitle:  { color:'#fff',fontSize:'1.5rem',fontWeight:700,margin:'0 0 6px' },
+  loginSub:    { color:'rgba(255,255,255,0.35)',fontSize:'0.85rem',margin:'0 0 28px' },
+  loginForm:   { display:'flex',flexDirection:'column',gap:12 },
+  loginInput:  { background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.1)',borderRadius:10,padding:'13px 16px',color:'#fff',fontSize:'0.95rem',fontFamily:'inherit' },
+  loginErr:    { color:'#e74c3c',fontSize:'0.82rem',margin:0 },
+  loginBtn:    { background:'linear-gradient(135deg,#00d9ff,#0099bb)',color:'#000',border:'none',borderRadius:10,padding:14,fontSize:'0.95rem',fontWeight:700,cursor:'pointer',fontFamily:'inherit' },
 
-  // Page
-  page:         { background:'#050608', minHeight:'100vh', fontFamily:'Roboto,system-ui,sans-serif', color:'#f4f5f7' },
+  page:        { background:'#050608',minHeight:'100vh',fontFamily:'Roboto,system-ui,sans-serif',color:'#f4f5f7' },
+  topBar:      { background:'rgba(15,17,23,0.97)',borderBottom:'1px solid rgba(255,255,255,0.07)',padding:'0 24px',height:56,display:'flex',alignItems:'center',justifyContent:'space-between',position:'sticky',top:0,zIndex:100 },
+  topBarLeft:  { display:'flex',alignItems:'center',gap:12 },
+  topLogo:     { height:32,width:'auto',objectFit:'contain' },
+  topTitle:    { color:'#fff',fontWeight:700,fontSize:'0.9rem' },
+  topBadge:    { background:'rgba(231,76,60,0.12)',border:'1px solid rgba(231,76,60,0.25)',color:'#e74c3c',padding:'2px 8px',borderRadius:20,fontSize:'0.6rem',fontWeight:700,letterSpacing:'0.1em' },
+  topBarRight: { display:'flex',alignItems:'center',gap:10 },
+  topLink:     { color:'rgba(255,255,255,0.6)',textDecoration:'none',fontSize:'0.82rem',padding:'6px 12px',background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.08)',borderRadius:7 },
+  topLogout:   { background:'transparent',border:'1px solid rgba(255,255,255,0.1)',borderRadius:7,color:'rgba(255,255,255,0.4)',padding:'6px 12px',fontSize:'0.78rem',cursor:'pointer',fontFamily:'inherit' },
 
-  // Top bar
-  topBar:       { background:'rgba(15,17,23,0.95)', borderBottom:'1px solid rgba(255,255,255,0.07)', padding:'0 24px', height:56, display:'flex', alignItems:'center', justifyContent:'space-between', position:'sticky', top:0, zIndex:100 },
-  topBarLeft:   { display:'flex', alignItems:'center', gap:12 },
-  topLogo:      { height:32, width:'auto', objectFit:'contain' },
-  topTitle:     { color:'#fff', fontWeight:700, fontSize:'0.9rem' },
-  topBadge:     { background:'rgba(231,76,60,0.12)', border:'1px solid rgba(231,76,60,0.25)', color:'#e74c3c', padding:'2px 8px', borderRadius:20, fontSize:'0.6rem', fontWeight:700, letterSpacing:'0.1em' },
-  topBarRight:  { display:'flex', alignItems:'center', gap:10 },
-  topLink:      { color:'rgba(255,255,255,0.6)', textDecoration:'none', fontSize:'0.82rem', padding:'6px 12px', background:'rgba(255,255,255,0.04)', border:'1px solid rgba(255,255,255,0.08)', borderRadius:7, transition:'all 0.2s' },
-  topLogout:    { background:'transparent', border:'1px solid rgba(255,255,255,0.1)', borderRadius:7, color:'rgba(255,255,255,0.4)', padding:'6px 12px', fontSize:'0.78rem', cursor:'pointer', fontFamily:'inherit' },
+  layout:      { maxWidth:1200,margin:'0 auto',padding:'24px 24px 60px',display:'flex',flexDirection:'column',gap:20 },
+  statsRow:    { display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12 },
+  statCard:    { background:'#0f1117',border:'1px solid rgba(255,255,255,0.07)',borderRadius:12,padding:'18px 20px',display:'flex',flexDirection:'column',gap:4 },
+  statVal:     { fontSize:'1.8rem',fontWeight:700,lineHeight:1 },
+  statLabel:   { color:'rgba(255,255,255,0.4)',fontSize:'0.75rem' },
 
-  // Layout
-  layout:       { maxWidth:1200, margin:'0 auto', padding:'24px 24px 60px', display:'flex', flexDirection:'column', gap:20 },
+  panel:       { background:'#0f1117',border:'1px solid rgba(255,255,255,0.07)',borderRadius:16,padding:28 },
+  panelTitle:  { color:'#fff',fontSize:'1rem',fontWeight:700,margin:'0 0 20px' },
 
-  // Stats
-  statsRow:     { display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:12 },
-  statCard:     { background:'#0f1117', border:'1px solid rgba(255,255,255,0.07)', borderRadius:12, padding:'18px 20px', display:'flex', flexDirection:'column', gap:4 },
-  statVal:      { fontSize:'1.8rem', fontWeight:700, lineHeight:1 },
-  statLabel:    { color:'rgba(255,255,255,0.4)', fontSize:'0.75rem', fontWeight:500 },
+  step:        { marginBottom:22 },
+  stepHead:    { display:'flex',alignItems:'center',gap:10,marginBottom:12 },
+  stepNum:     { width:28,height:28,borderRadius:'50%',background:'rgba(0,217,255,0.1)',border:'1px solid rgba(0,217,255,0.25)',color:'#00d9ff',fontSize:'0.78rem',fontWeight:700,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0 },
+  stepLbl:     { color:'rgba(255,255,255,0.7)',fontSize:'0.85rem',fontWeight:600 },
 
-  // Panels
-  searchPanel:  { background:'#0f1117', border:'1px solid rgba(255,255,255,0.07)', borderRadius:16, padding:28 },
-  sessionsPanel:{ background:'#0f1117', border:'1px solid rgba(255,255,255,0.07)', borderRadius:16, padding:28 },
-  sessionsPanelHead: { display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:18 },
-  sectionTitle: { color:'#fff', fontSize:'1rem', fontWeight:700, margin:'0 0 20px' },
-  refreshBtn:   { background:'rgba(255,255,255,0.05)', border:'1px solid rgba(255,255,255,0.1)', borderRadius:7, color:'rgba(255,255,255,0.5)', padding:'6px 14px', fontSize:'0.78rem', cursor:'pointer', fontFamily:'inherit' },
+  catGrid:     { display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(190px,1fr))',gap:8 },
+  catBtn:      { background:'rgba(255,255,255,0.03)',border:'1px solid rgba(255,255,255,0.08)',borderRadius:10,padding:'11px 13px',cursor:'pointer',fontFamily:'inherit',textAlign:'left',display:'flex',flexDirection:'column',gap:3,transition:'all 0.15s' },
+  catBtnOn:    { background:'rgba(0,217,255,0.08)',border:'1px solid rgba(0,217,255,0.3)' },
+  catBtnLabel: { color:'#fff',fontSize:'0.82rem',fontWeight:600 },
+  catBtnDesc:  { color:'rgba(255,255,255,0.32)',fontSize:'0.65rem',lineHeight:1.4 },
 
-  // Steps
-  step:         { marginBottom:24 },
-  stepHead:     { display:'flex', alignItems:'center', gap:10, marginBottom:14 },
-  stepNum:      { width:28, height:28, borderRadius:'50%', background:'rgba(0,217,255,0.1)', border:'1px solid rgba(0,217,255,0.25)', color:'#00d9ff', fontSize:'0.78rem', fontWeight:700, display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0 },
-  stepLabel2:   { color:'rgba(255,255,255,0.7)', fontSize:'0.85rem', fontWeight:600 },
+  rulesRow:    { display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(200px,1fr))',gap:8,marginBottom:10 },
+  ruleCard:    { background:'rgba(255,255,255,0.03)',border:'1px solid rgba(255,255,255,0.07)',borderRadius:9,padding:'11px 13px',display:'flex',alignItems:'flex-start',gap:10 },
+  ruleIcon:    { fontSize:'1.1rem',flexShrink:0,marginTop:1 },
+  ruleTitle:   { display:'block',color:'rgba(255,255,255,0.38)',fontSize:'0.63rem',textTransform:'uppercase',letterSpacing:'0.08em',marginBottom:3 },
+  ruleVal:     { display:'block',fontSize:'0.8rem',fontWeight:600 },
+  strictWarn:  { background:'rgba(231,76,60,0.07)',border:'1px solid rgba(231,76,60,0.18)',borderRadius:8,padding:'10px 14px',color:'rgba(255,255,255,0.55)',fontSize:'0.78rem',lineHeight:1.6 },
 
-  // Category buttons
-  catGrid:      { display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(200px,1fr))', gap:8 },
-  catBtn:       { background:'rgba(255,255,255,0.03)', border:'1px solid rgba(255,255,255,0.08)', borderRadius:10, padding:'12px 14px', cursor:'pointer', fontFamily:'inherit', textAlign:'left', display:'flex', flexDirection:'column', gap:4, transition:'all 0.15s' },
-  catBtnActive: { background:'rgba(0,217,255,0.08)', border:'1px solid rgba(0,217,255,0.3)' },
-  catBtnLabel:  { color:'#fff', fontSize:'0.82rem', fontWeight:600 },
-  catBtnDesc:   { color:'rgba(255,255,255,0.35)', fontSize:'0.68rem', lineHeight:1.4 },
+  launchBtn:   { display:'flex',alignItems:'center',justifyContent:'center',gap:8,background:'linear-gradient(135deg,#00d9ff,#0099bb)',color:'#000',border:'none',borderRadius:11,padding:'15px 28px',fontSize:'0.95rem',fontWeight:700,cursor:'pointer',fontFamily:'inherit',transition:'opacity 0.2s' },
+  launchBtnBusy:{ background:'rgba(255,255,255,0.08)',color:'rgba(255,255,255,0.5)',cursor:'not-allowed' },
+  stopBtn:     { background:'rgba(231,76,60,0.1)',border:'1px solid rgba(231,76,60,0.25)',color:'#e74c3c',borderRadius:11,padding:'15px 20px',fontSize:'0.88rem',fontWeight:700,cursor:'pointer',fontFamily:'inherit' },
+  launchNote:  { color:'rgba(255,255,255,0.28)',fontSize:'0.73rem',marginTop:10,lineHeight:1.6 },
+  spinner:     { width:18,height:18,border:'2px solid rgba(0,0,0,0.2)',borderTopColor:'#000',borderRadius:'50%',animation:'dashSpin 0.7s linear infinite',flexShrink:0 },
 
-  // Quality rules
-  rulesGrid:    { display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(220px,1fr))', gap:8, marginBottom:10 },
-  ruleCard:     { background:'rgba(255,255,255,0.03)', border:'1px solid rgba(255,255,255,0.07)', borderRadius:9, padding:'12px 14px', display:'flex', alignItems:'flex-start', gap:10 },
-  ruleIcon:     { fontSize:'1.1rem', flexShrink:0, marginTop:2 },
-  ruleTitle:    { display:'block', color:'rgba(255,255,255,0.4)', fontSize:'0.65rem', textTransform:'uppercase', letterSpacing:'0.08em', marginBottom:3 },
-  ruleVal:      { display:'block', color:'rgba(255,255,255,0.8)', fontSize:'0.8rem', fontWeight:600 },
-  strictWarning:{ background:'rgba(231,76,60,0.07)', border:'1px solid rgba(231,76,60,0.2)', borderRadius:8, padding:'10px 14px', color:'rgba(255,255,255,0.6)', fontSize:'0.78rem', lineHeight:1.6 },
+  progressWrap:{ background:'rgba(0,217,255,0.04)',border:'1px solid rgba(0,217,255,0.12)',borderRadius:12,padding:16,marginTop:14 },
+  progressBar: { height:6,background:'rgba(255,255,255,0.07)',borderRadius:6,overflow:'hidden',marginBottom:8 },
+  progressFill:{ height:'100%',background:'linear-gradient(90deg,#00d9ff,#0099bb)',borderRadius:6,transition:'width 0.5s ease',animation:'progressPulse 2s ease-in-out infinite' },
+  progressInfo:{ display:'flex',justifyContent:'space-between',flexWrap:'wrap',gap:6 },
+  progressText:{ color:'rgba(255,255,255,0.55)',fontSize:'0.78rem' },
+  currentQuery:{ color:'rgba(255,255,255,0.35)',fontSize:'0.72rem',margin:'6px 0 0',fontStyle:'italic' },
 
-  // Launch
-  launchBtn:    { display:'flex', alignItems:'center', justifyContent:'center', gap:8, width:'100%', background:'linear-gradient(135deg,#00d9ff,#0099bb)', color:'#000', border:'none', borderRadius:11, padding:'16px', fontSize:'1rem', fontWeight:700, cursor:'pointer', fontFamily:'inherit', transition:'opacity 0.2s,transform 0.1s', maxWidth:400 },
-  launchBtnBusy:{ background:'rgba(255,255,255,0.08)', color:'rgba(255,255,255,0.5)', cursor:'not-allowed', transform:'none' },
-  launchNote:   { color:'rgba(255,255,255,0.3)', fontSize:'0.75rem', marginTop:10, lineHeight:1.6 },
-  spinner:      { width:18, height:18, border:'2px solid rgba(0,0,0,0.2)', borderTopColor:'#000', borderRadius:'50%', animation:'dashSpin 0.7s linear infinite', flexShrink:0 },
+  msgSuccess:  { background:'rgba(46,204,113,0.08)',border:'1px solid rgba(46,204,113,0.2)',borderRadius:9,padding:'12px 16px',color:'#2ecc71',fontSize:'0.85rem',marginTop:14 },
+  msgError:    { background:'rgba(231,76,60,0.08)',border:'1px solid rgba(231,76,60,0.2)',borderRadius:9,padding:'12px 16px',color:'#e74c3c',fontSize:'0.85rem',marginTop:14 },
 
-  // Messages
-  msgSuccess:   { background:'rgba(46,204,113,0.08)', border:'1px solid rgba(46,204,113,0.2)', borderRadius:9, padding:'12px 16px', color:'#2ecc71', fontSize:'0.85rem', lineHeight:1.6 },
-  msgError:     { background:'rgba(231,76,60,0.08)', border:'1px solid rgba(231,76,60,0.2)', borderRadius:9, padding:'12px 16px', color:'#e74c3c', fontSize:'0.85rem' },
+  logBox:      { background:'#070a0f',border:'1px solid rgba(255,255,255,0.06)',borderRadius:10,padding:'12px 16px',marginTop:14,maxHeight:180,overflowY:'auto' },
+  logTitle:    { color:'rgba(255,255,255,0.3)',fontSize:'0.63rem',textTransform:'uppercase',letterSpacing:'0.1em',margin:'0 0 8px' },
+  logLine:     { color:'rgba(255,255,255,0.65)',fontSize:'0.75rem',margin:'0 0 4px',lineHeight:1.5,fontFamily:'monospace' },
 
-  // Sessions
-  emptyNote:    { color:'rgba(255,255,255,0.25)', fontSize:'0.82rem', margin:0 },
-  sessionList:  { display:'flex', flexDirection:'column', gap:10 },
-  sessionCard:  { background:'rgba(255,255,255,0.02)', border:'1px solid rgba(255,255,255,0.07)', borderRadius:11, overflow:'hidden' },
-  sessionHead:  { display:'flex', alignItems:'center', justifyContent:'space-between', padding:'14px 16px', cursor:'pointer', flexWrap:'wrap', gap:8 },
-  sessionInfo:  { display:'flex', flexDirection:'column', gap:3 },
-  sessionCats:  { color:'rgba(255,255,255,0.75)', fontSize:'0.82rem', fontWeight:600, textTransform:'capitalize' },
-  sessionTime:  { color:'rgba(255,255,255,0.3)', fontSize:'0.72rem' },
-  sessionStats: { display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' },
-  sessionStat:  { fontSize:'0.8rem', fontWeight:700 },
-  sessionStatus:{ padding:'2px 9px', borderRadius:20, fontSize:'0.65rem', fontWeight:700, letterSpacing:'0.06em' },
-  sessionToggle:{ color:'rgba(255,255,255,0.3)', fontSize:'0.75rem', marginLeft:4 },
+  emptyNote:   { color:'rgba(255,255,255,0.25)',fontSize:'0.82rem',margin:0 },
+  refreshBtn:  { background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.1)',borderRadius:7,color:'rgba(255,255,255,0.5)',padding:'6px 14px',fontSize:'0.78rem',cursor:'pointer',fontFamily:'inherit' },
 
-  // Session products
-  sessionProdsWrap: { borderTop:'1px solid rgba(255,255,255,0.06)', padding:'16px' },
-  prodGrid:     { display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(240px,1fr))', gap:12 },
-  prodCard:     { background:'rgba(255,255,255,0.03)', border:'1px solid rgba(255,255,255,0.07)', borderRadius:10, overflow:'hidden', display:'flex', flexDirection:'column' },
-  prodImgWrap:  { height:130, background:'#fff', display:'flex', alignItems:'center', justifyContent:'center', overflow:'hidden' },
-  prodImg:      { width:'100%', height:'100%', objectFit:'contain', padding:8 },
-  prodImgPh:    { fontSize:40, color:'rgba(0,0,0,0.15)' },
-  prodInfo:     { padding:'10px 12px', display:'flex', flexDirection:'column', gap:6 },
-  prodName:     { color:'rgba(255,255,255,0.8)', fontSize:'0.76rem', lineHeight:1.4, margin:0 },
-  prodMeta:     { display:'flex', gap:5, flexWrap:'wrap' },
-  prodBadge:    { padding:'2px 7px', borderRadius:5, fontSize:'0.65rem', fontWeight:600 },
-  prodActions:  { display:'flex', gap:8, marginTop:4 },
-  approveBtn:   { flex:1, background:'rgba(46,204,113,0.12)', border:'1px solid rgba(46,204,113,0.25)', color:'#2ecc71', borderRadius:7, padding:'7px', fontSize:'0.75rem', fontWeight:700, cursor:'pointer', fontFamily:'inherit' },
-  rejectBtn:    { flex:1, background:'rgba(231,76,60,0.08)', border:'1px solid rgba(231,76,60,0.2)', color:'#e74c3c', borderRadius:7, padding:'7px', fontSize:'0.75rem', fontWeight:700, cursor:'pointer', fontFamily:'inherit' },
+  sessionCard: { background:'rgba(255,255,255,0.02)',border:'1px solid rgba(255,255,255,0.07)',borderRadius:11,overflow:'hidden' },
+  sessionHead: { display:'flex',alignItems:'center',justifyContent:'space-between',padding:'13px 16px',cursor:'pointer',flexWrap:'wrap',gap:8 },
+  sessionCats: { display:'block',color:'rgba(255,255,255,0.75)',fontSize:'0.82rem',fontWeight:600,textTransform:'capitalize',marginBottom:2 },
+  sessionTime: { display:'block',color:'rgba(255,255,255,0.3)',fontSize:'0.7rem' },
+  sessionStatusBadge: { padding:'2px 9px',borderRadius:20,fontSize:'0.63rem',fontWeight:700,letterSpacing:'0.06em' },
+
+  prodGrid:    { display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(220px,1fr))',gap:12 },
+  prodCard:    { background:'rgba(255,255,255,0.03)',border:'1px solid rgba(255,255,255,0.07)',borderRadius:10,overflow:'hidden',display:'flex',flexDirection:'column' },
+  prodImgWrap: { height:120,background:'#fff',display:'flex',alignItems:'center',justifyContent:'center',overflow:'hidden' },
+  prodImg:     { width:'100%',height:'100%',objectFit:'contain',padding:6 },
+  prodImgPh:   { fontSize:36,color:'rgba(0,0,0,0.15)' },
+  prodInfo:    { padding:'10px 12px',display:'flex',flexDirection:'column',gap:5 },
+  prodName:    { color:'rgba(255,255,255,0.8)',fontSize:'0.74rem',lineHeight:1.4,margin:0 },
+  prodMeta:    { display:'flex',gap:5,flexWrap:'wrap' },
+  badge:       { padding:'2px 7px',borderRadius:5,fontSize:'0.63rem',fontWeight:600 },
+  approveBtn:  { flex:1,background:'rgba(46,204,113,0.12)',border:'1px solid rgba(46,204,113,0.25)',color:'#2ecc71',borderRadius:7,padding:7,fontSize:'0.72rem',fontWeight:700,cursor:'pointer',fontFamily:'inherit' },
+  rejectBtn:   { flex:1,background:'rgba(231,76,60,0.08)',border:'1px solid rgba(231,76,60,0.2)',color:'#e74c3c',borderRadius:7,padding:7,fontSize:'0.72rem',fontWeight:700,cursor:'pointer',fontFamily:'inherit' },
 }
