@@ -141,11 +141,10 @@ export default async function handler(req, res) {
     if (job.status === 'completed')
       return res.status(200).json({ done: true, message: 'Job already completed' })
 
-    // Get next pending task
+    // Get next pending task — no orderBy to avoid needing a Firestore composite index
+    // Fetch all pending tasks and sort in JS instead
     const tasksSnap = await jobRef.collection('tasks')
       .where('status', '==', 'pending')
-      .orderBy('qi')
-      .limit(1)
       .get()
 
     if (tasksSnap.empty) {
@@ -162,9 +161,11 @@ export default async function handler(req, res) {
       })
     }
 
-    const taskDoc  = tasksSnap.docs[0]
-    const task     = taskDoc.data()
-    const taskRef  = taskDoc.ref
+    // Sort by qi in JS — no Firestore composite index needed
+    const sortedDocs = tasksSnap.docs.sort((a, b) => (a.data().qi || 0) - (b.data().qi || 0))
+    const taskDoc    = sortedDocs[0]
+    const task       = taskDoc.data()
+    const taskRef    = taskDoc.ref
 
     // Mark task as processing
     await taskRef.update({ status: 'processing', startedAt: new Date().toISOString() })
