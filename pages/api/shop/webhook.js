@@ -1,7 +1,7 @@
 /**
  * HUSIN ESHOP — POST /api/shop/webhook
- * FIXED: Properly handles Telegram callback_query from approve/reject buttons
- * REGISTER THIS URL with Telegram after deployment:
+ * UPDATED: Handles both old shop_session_ format AND new job_ format
+ * REGISTER THIS URL with Telegram:
  * https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://www.husin.org/api/shop/webhook
  */
 
@@ -56,24 +56,41 @@ export default async function handler(req, res) {
     try {
       if (!data) return
 
-      // Parse: "approve_prod_123_shop_session_456" or "reject_prod_123_shop_session_456"
+      // Parse callback_data format: "approve_<productId>_<sessionId>"
+      // productId = prod_TIMESTAMP_RANDOM
+      // sessionId = job_TIMESTAMP (new) or shop_session_TIMESTAMP (old)
       const firstUnderscore = data.indexOf('_')
       const action = data.substring(0, firstUnderscore) // "approve" or "reject"
 
       if (!['approve', 'reject'].includes(action)) return
 
-      // Rest is "prod_123_shop_session_456"
-      // sessionId always starts with "shop_session_"
-      const rest           = data.substring(firstUnderscore + 1)
-      const sessionStart   = rest.indexOf('shop_session_')
-      const productId      = rest.substring(0, sessionStart - 1) // remove trailing _
-      const sessionId      = rest.substring(sessionStart)
+      const rest = data.substring(firstUnderscore + 1)
+
+      // Parse: find sessionId — it starts with "job_" (new) or "shop_session_" (old)
+      let productId, sessionId
+
+      if (rest.includes('_job_')) {
+        // New format: prod_TIMESTAMP_RANDOM_job_TIMESTAMP
+        const jobIdx = rest.lastIndexOf('_job_')
+        productId = rest.substring(0, jobIdx)
+        sessionId = rest.substring(jobIdx + 1) // "job_TIMESTAMP"
+      } else if (rest.includes('shop_session_')) {
+        // Old format: prod_123_shop_session_456
+        const sessionStart = rest.indexOf('shop_session_')
+        productId = rest.substring(0, sessionStart - 1)
+        sessionId = rest.substring(sessionStart)
+      } else {
+        // Fallback: last segment after final underscore group
+        const parts = rest.split('_')
+        sessionId = parts.slice(-2).join('_')
+        productId = parts.slice(0, -2).join('_')
+      }
 
       const decision = action === 'approve' ? 'approved' : 'rejected'
 
       console.log(`[Webhook] ${decision} — product: ${productId} session: ${sessionId}`)
 
-      // Get product from Firestore
+      // Try to find product in shop_search_sessions (both old and new jobs)
       const productRef = db
         .collection('shop_search_sessions').doc(sessionId)
         .collection('products').doc(productId)
@@ -81,20 +98,52 @@ export default async function handler(req, res) {
       const productSnap = await productRef.get()
 
       if (!productSnap.exists) {
-        await tgAnswer(callbackId, '⚠️ Product not found', true)
+        // Try direct from shop_approved_products (pending)
+        const directRef  = db.collection('shop_approved_products').doc(productId)
+        const directSnap = await directRef.get()
+        if (!directSnap.exists) {
+          await tgAnswer(callbackId, '⚠️ Product not found. Try from inbox.', true)
+          return
+        }
+        // Handle from direct doc
+        const product = directSnap.data()
+        if (product.status === 'live') {
+          await tgAnswer(callbackId, '✅ Already approved and live!', true)
+          return
+        }
+        if (product.status === 'rejected') {
+          await tgAnswer(callbackId, '❌ Already rejected.', true)
+          return
+        }
+
+        if (decision === 'approved') {
+          await directRef.update({ status: 'live', approvedAt: new Date().toISOString() })
+          await tgAnswer(callbackId, '✅ Approved! Product is now LIVE on your marketplace.', false)
+        } else {
+          await directRef.update({ status: 'rejected', rejectedAt: new Date().toISOString() })
+          await db.collection('shop_rejected_products').doc(productId).set({
+            ...product,
+            rejectedAt: new Date().toISOString(),
+          })
+          await tgAnswer(callbackId, '❌ Rejected.', false)
+        }
+
+        if (message?.chat?.id && message?.message_id) {
+          await tgEditButtons(message.chat.id, message.message_id)
+        }
         return
       }
 
       const product = productSnap.data()
 
       // Already decided
-      if (product.decision !== 'pending') {
+      if (product.decision && product.decision !== 'pending') {
         const icon = product.decision === 'approved' ? '✅' : '❌'
         await tgAnswer(callbackId, `Already ${product.decision} ${icon}`, true)
         return
       }
 
-      // Write decision
+      // Write decision to session
       await productRef.update({
         decision,
         decidedAt:   new Date().toISOString(),
@@ -109,31 +158,45 @@ export default async function handler(req, res) {
           sessionId,
           name:                  product.name,
           image:                 product.image   || null,
-          sellingPriceSAR:       product.pricing?.sellingPriceSAR   || null,
-          sellingPriceFormatted: product.pricing?.sellingPriceFormatted || 'Price on request',
+          additionalImages:      product.additionalImages || [],
+          sellingPriceSAR:       product.pricing?.sellingPriceSAR   || product.sellingPriceSAR  || null,
+          sellingPriceFormatted: product.pricing?.sellingPriceFormatted || product.sellingPriceFormatted || 'Price on request',
           category:              product.category || 'general',
-          specifications:        product.specifications || null,
-          sourceId:              product.sourceId,
-          sourceName:            product.sourceName,
-          _sourceLink:           product.sourceLink,
-          _sourcePriceSAR:       product.pricing?.sourcePriceSAR || null,
-          _profitSAR:            product.pricing?.profitSAR      || null,
+          specifications:        product.specifications || product.condition || null,
+          aspects:               product.aspects || [],
+          condition:             product.condition || 'New',
+          brand:                 product.brand  || null,
+          color:                 product.color  || null,
+          size:                  product.size   || null,
+          qualityScore:          product.qualityScore || 60,
+          sourceId:              product.sourceId  || 'ebay',
+          sourceName:            product.sourceName || 'eBay',
+          _sourceLink:           product.sourceLink || product._sourceLink || '',
+          _sourcePriceSAR:       product.pricing?.sourcePriceSAR || product._sourcePriceSAR || null,
+          _profitSAR:            product.pricing?.profitSAR      || product._profitSAR      || null,
           approvedAt:            new Date().toISOString(),
           status:                'live',
           views:                 0,
           sales:                 0,
-        })
+        }, { merge: true })
+
         await tgAnswer(callbackId, '✅ Approved! Product is now LIVE on your marketplace.', false)
       } else {
-        // Save to rejected list
+        // Save to rejected
         await db.collection('shop_rejected_products').doc(productId).set({
           id:         productId,
           sessionId,
           name:       product.name,
-          sourceId:   product.sourceId,
-          sourceName: product.sourceName,
+          sourceId:   product.sourceId   || 'ebay',
+          sourceName: product.sourceName || 'eBay',
           rejectedAt: new Date().toISOString(),
         })
+
+        // Also update status in shop_approved_products if it exists
+        db.collection('shop_approved_products').doc(productId)
+          .update({ status: 'rejected', rejectedAt: new Date().toISOString() })
+          .catch(() => {})
+
         await tgAnswer(callbackId, '❌ Rejected.', false)
       }
 
