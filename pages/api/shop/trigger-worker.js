@@ -1,92 +1,19 @@
 /**
  * HUSIN ESHOP — POST /api/shop/trigger-worker
- * FREE PLAN COMPATIBLE — processes ONE eBay query per call
- * Each call completes in < 8 seconds (well under 10s Vercel limit)
- * Called repeatedly by dashboard until all tasks are done
- *
- * Flow:
- * 1. Fetches next pending task from Firestore job
- * 2. Calls eBay Browse API for that ONE query
- * 3. Applies quality filter to each result
- * 4. Saves passing products + sends to Telegram
- * 5. Marks task done
- * 6. Returns { done: false } if more tasks remain, { done: true } when complete
+ * FREE PLAN COMPATIBLE — processes ONE eBay query per call (~5s each)
+ * FIXED: Uses correct function names from actual lib files:
+ *   - calculatePrice() from pricingEngine (NOT applyMarkup)
+ *   - loadExistingFingerprints() + filterNewProducts() from deduplicator (NOT isDuplicate)
+ *   - Inline Telegram sender (NOT sendToTelegram which doesn't exist)
  */
 
-import { db }          from '../../../lib/firebaseAdmin'
-import { applyMarkup } from '../../../lib/pricingEngine'
-import { isDuplicate } from '../../../lib/deduplicator'
-
-// Inline Telegram sender — sends one product at a time with approve/reject buttons
-// Does NOT import from telegramNotifier to avoid export name mismatch
-async function sendProductToTelegram(product, sessionId) {
-  const BOT  = process.env.TELEGRAM_BOT_TOKEN
-  const CHAT = process.env.TELEGRAM_CHAT_ID
-
-  if (!BOT || !CHAT) {
-    console.log('[Worker] Telegram credentials missing — skipping notification')
-    return
-  }
-
-  const price = product.sellingPriceSAR
-    ? `${product.sellingPriceSAR.toLocaleString('en-SA')} SAR`
-    : 'N/A'
-
-  const text = [
-    `🛒 NEW PRODUCT — ${product.category?.replace(/_/g,' ')?.toUpperCase()}`,
-    ``,
-    `📦 ${product.name}`,
-    `💰 Sell Price: ${price}`,
-    `📋 Condition: ${product.condition || 'New'}`,
-    product.brand ? `🏷️ Brand: ${product.brand}` : '',
-    product.color ? `🎨 Color: ${product.color}` : '',
-    product.size  ? `📐 Size: ${product.size}`   : '',
-    `⭐ Quality Score: ${product.qualityScore || 60}/100`,
-    ``,
-    `Tap below to Approve or Reject`,
-  ].filter(Boolean).join('\n')
-
-  // callback_data format must match webhook.js parser:
-  // "approve_<productId>_<sessionId>"
-  const keyboard = {
-    inline_keyboard: [[
-      { text: '✅ Approve → Publish', callback_data: `approve_${product.id}_${sessionId}` },
-      { text: '❌ Reject',            callback_data: `reject_${product.id}_${sessionId}`  },
-    ]]
-  }
-
-  try {
-    // Try with image first
-    if (product.image) {
-      const photoRes = await fetch(`https://api.telegram.org/bot${BOT}/sendPhoto`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({
-          chat_id:      CHAT,
-          photo:        product.image,
-          caption:      text,
-          reply_markup: keyboard,
-        }),
-        signal: AbortSignal.timeout(6000),
-      })
-      const photoData = await photoRes.json()
-      if (photoData.ok) return
-    }
-    // Fallback to text message
-    await fetch(`https://api.telegram.org/bot${BOT}/sendMessage`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({
-        chat_id:      CHAT,
-        text,
-        reply_markup: keyboard,
-      }),
-      signal: AbortSignal.timeout(6000),
-    })
-  } catch (e) {
-    console.log('[Worker] Telegram send failed:', e.message)
-  }
-}
+import { db }                     from '../../../lib/firebaseAdmin'
+import { calculatePrice }          from '../../../lib/pricingEngine'
+import {
+  loadExistingFingerprints,
+  filterNewProducts,
+  saveToInitialList,
+}                                  from '../../../lib/deduplicator'
 
 const EBAY_APP_ID = process.env.EBAY_APP_ID
 const EBAY_SECRET = process.env.EBAY_SECRET
@@ -105,18 +32,18 @@ async function getEbayToken() {
     signal: AbortSignal.timeout(6000),
   })
   const data = await res.json()
-  if (!data.access_token) throw new Error('eBay OAuth failed')
+  if (!data.access_token) throw new Error('eBay OAuth failed: ' + JSON.stringify(data))
   return data.access_token
 }
 
-// ── eBay search (item summaries only — fast, no second call needed) ───────────
+// ── eBay Search ───────────────────────────────────────────────────────────────
 async function searchEbay(token, task) {
   const conditionFilter = task.conditionIds.map(id => `conditionIds:{${id}}`).join(',')
   const params = new URLSearchParams({
     q:            task.query,
     category_ids: task.ebayCategoryId,
     filter:       conditionFilter,
-    limit:        '8',  // 8 items per query — fast enough for 10s limit
+    limit:        '8',
   })
 
   const res = await fetch(
@@ -130,67 +57,123 @@ async function searchEbay(token, task) {
       signal: AbortSignal.timeout(6000),
     }
   )
-  if (!res.ok) return []
+  if (!res.ok) {
+    const errText = await res.text()
+    throw new Error(`eBay search failed: ${res.status} — ${errText.substring(0, 100)}`)
+  }
   const data = await res.json()
   return data.itemSummaries || []
 }
 
-// ── Quality filter (uses item summary data only — no second eBay call) ────────
+// ── Quality Filter ────────────────────────────────────────────────────────────
 function qualityFilter(item, task) {
   const conditionStr = (item.condition || '').toLowerCase()
   const conditionId  = item.conditionId || ''
   const name         = (item.title     || '').toLowerCase()
   const price        = parseFloat(item.price?.value || '0')
 
-  // PRICE
   if (!price || price <= 0 || price > 5000)
     return { pass: false, reason: `Invalid price: $${price}` }
 
-  // CONDITION — reject used/damaged
   const badConditions = ['used', 'refurbish', 'pre-owned', 'for parts', 'open box', 'not working']
   if (badConditions.some(c => conditionStr.includes(c)))
-    return { pass: false, reason: `Rejected condition: ${item.condition}` }
+    return { pass: false, reason: `Bad condition: ${item.condition}` }
 
-  if (conditionId === '3000' || conditionId === '2000' || conditionId === '7000')
-    return { pass: false, reason: `Used/refurb condition ID: ${conditionId}` }
+  if (['3000','2000','7000'].includes(conditionId))
+    return { pass: false, reason: `Used/refurb conditionId: ${conditionId}` }
 
-  // STRICT check for electronics
   if (task.strictSpecs && conditionId !== '1000') {
     if (!conditionStr.includes('new with') && conditionStr !== 'new')
       return { pass: false, reason: `Electronics needs 100% new. Got: ${item.condition}` }
   }
 
-  // BAD KEYWORDS in title
-  const badWords = ['broken', 'damaged', 'parts only', 'for parts', 'cracked',
-    'as is', 'untested', 'defective', 'lot of', 'junk', 'faulty']
+  const badWords = ['broken','damaged','parts only','for parts','cracked','as is','untested','defective','lot of','junk','faulty']
   if (badWords.some(w => name.includes(w)))
-    return { pass: false, reason: `Bad keyword in title` }
+    return { pass: false, reason: 'Bad keyword in title' }
 
-  // MUST HAVE IMAGE
-  const hasImage = !!(item.image?.imageUrl || item.thumbnailImages?.[0]?.imageUrl)
-  if (!hasImage)
+  if (!item.image?.imageUrl && !item.thumbnailImages?.[0]?.imageUrl)
     return { pass: false, reason: 'No image' }
 
-  // ASPECTS — check from item summary's additionalImages count + localizedAspects
-  // Item summary has limited aspects — we just check what we have
-  const aspects     = item.localizedAspects || []
-  const aspectCount = aspects.length
-
-  // For item summaries, aspect count is often 0 — we relax this check
-  // Full aspects are loaded on the product page via product-details.js
-  const hasMinAspects = aspectCount >= task.minAspects
-
-  // Calculate quality score
-  let score = 50
-  if (conditionId === '1000')     score += 15
-  if (aspectCount >= 5)           score += 15
-  if (aspectCount >= 8)           score += 10
+  let score = 55
+  if (conditionId === '1000') score += 20
+  if ((item.localizedAspects || []).length >= 5) score += 15
   if (item.additionalImages?.length > 0) score += 10
 
-  return { pass: true, reason: 'Passed', score: Math.min(score, 100) }
+  return { pass: true, score: Math.min(score, 100) }
 }
 
-// ── Main handler ──────────────────────────────────────────────────────────────
+// ── Inline Telegram Sender ────────────────────────────────────────────────────
+// Self-contained — no imports from lib/telegramNotifier needed
+async function sendProductToTelegram(product, sessionId) {
+  const BOT  = process.env.TELEGRAM_BOT_TOKEN
+  const CHAT = process.env.TELEGRAM_CHAT_ID
+
+  if (!BOT || !CHAT) {
+    console.log('[Worker] Telegram env vars missing — skipping')
+    return
+  }
+
+  const price = product.sellingPriceSAR
+    ? `${product.sellingPriceSAR.toLocaleString('en-SA')} SAR`
+    : 'N/A'
+
+  const sourceSAR = product._sourcePriceSAR
+    ? `${product._sourcePriceSAR.toLocaleString('en-SA')} SAR`
+    : 'N/A'
+
+  const profitSAR = (product.sellingPriceSAR && product._sourcePriceSAR)
+    ? `${(product.sellingPriceSAR - product._sourcePriceSAR).toLocaleString('en-SA')} SAR`
+    : 'N/A'
+
+  const text = [
+    `🛒 NEW PRODUCT — ${(product.category||'').replace(/_/g,' ').toUpperCase()}`,
+    ``,
+    `📦 ${product.name}`,
+    `💰 Your Sell Price: ${price}`,
+    `🏷️ Source Cost: ${sourceSAR}`,
+    `💵 Your Profit: ${profitSAR}`,
+    `📋 Condition: ${product.condition || 'New'}`,
+    product.brand ? `🏷️ Brand: ${product.brand}` : null,
+    product.color ? `🎨 Color: ${product.color}` : null,
+    product.size  ? `📐 Size: ${product.size}`   : null,
+    `⭐ Quality: ${product.qualityScore || 60}/100`,
+    ``,
+    `Approve to publish to marketplace ↓`,
+  ].filter(Boolean).join('\n')
+
+  // callback_data format: "approve_<productId>_<sessionId>"
+  // webhook.js parses this to find the product and update Firestore
+  const keyboard = {
+    inline_keyboard: [[
+      { text: '✅ Approve → Live', callback_data: `approve_${product.id}_${sessionId}` },
+      { text: '❌ Reject',         callback_data: `reject_${product.id}_${sessionId}`  },
+    ]]
+  }
+
+  try {
+    if (product.image) {
+      const r = await fetch(`https://api.telegram.org/bot${BOT}/sendPhoto`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ chat_id:CHAT, photo:product.image, caption:text, reply_markup:keyboard }),
+        signal:  AbortSignal.timeout(6000),
+      })
+      const d = await r.json()
+      if (d.ok) return
+    }
+    // Fallback text
+    await fetch(`https://api.telegram.org/bot${BOT}/sendMessage`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ chat_id:CHAT, text, reply_markup:keyboard }),
+      signal:  AbortSignal.timeout(6000),
+    })
+  } catch (e) {
+    console.log('[Worker] Telegram send error:', e.message)
+  }
+}
+
+// ── Main Handler ──────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
   if (req.method !== 'POST')
     return res.status(405).json({ error: 'Method not allowed' })
@@ -211,18 +194,13 @@ export default async function handler(req, res) {
     if (job.status === 'completed')
       return res.status(200).json({ done: true, message: 'Job already completed' })
 
-    // Get next pending task — no orderBy to avoid needing a Firestore composite index
-    // Fetch all pending tasks and sort in JS instead
+    // Get all pending tasks — sort in JS (no Firestore composite index needed)
     const tasksSnap = await jobRef.collection('tasks')
       .where('status', '==', 'pending')
       .get()
 
     if (tasksSnap.empty) {
-      // No more pending tasks — mark job complete
-      await jobRef.update({
-        status:      'completed',
-        completedAt: new Date().toISOString(),
-      })
+      await jobRef.update({ status: 'completed', completedAt: new Date().toISOString() })
       return res.status(200).json({
         done:     true,
         accepted: job.accepted || 0,
@@ -231,55 +209,71 @@ export default async function handler(req, res) {
       })
     }
 
-    // Sort by qi in JS — no Firestore composite index needed
+    // Sort by qi in JS — pick lowest qi (first in queue)
     const sortedDocs = tasksSnap.docs.sort((a, b) => (a.data().qi || 0) - (b.data().qi || 0))
     const taskDoc    = sortedDocs[0]
     const task       = taskDoc.data()
     const taskRef    = taskDoc.ref
 
-    // Mark task as processing
     await taskRef.update({ status: 'processing', startedAt: new Date().toISOString() })
 
     let accepted = 0
     let rejected = 0
 
     try {
-      // Get eBay token
+      // 1. Get eBay token
       const ebayToken = await getEbayToken()
 
-      // Search eBay for this ONE query
+      // 2. Search eBay for this ONE query
       const items = await searchEbay(ebayToken, task)
+      console.log(`[Worker] Query "${task.query}" → ${items.length} items`)
 
-      // Process each item
+      // 3. Load existing fingerprints for deduplication
+      const existingFingerprints = await loadExistingFingerprints('shop_initial_products')
+
+      // 4. Process each item
+      const newItems = []
       for (const item of items) {
         // Quality filter
         const quality = qualityFilter(item, task)
         if (!quality.pass) {
+          console.log(`[Worker] Reject: ${item.title?.substring(0,40)} — ${quality.reason}`)
           rejected++
           continue
         }
 
-        // Deduplication
-        const fingerprint = (item.title || '').toLowerCase()
-          .replace(/\s+/g, '-')
-          .replace(/[^a-z0-9-]/g, '')
-          .substring(0, 80)
+        // Build candidate for deduplication check
+        const candidate = {
+          name:     item.title,
+          rawPrice: item.price?.value,
+          sourceId: 'ebay',
+        }
+        const filtered = filterNewProducts([candidate], existingFingerprints)
+        if (filtered.length === 0) {
+          console.log(`[Worker] Duplicate: ${item.title?.substring(0,40)}`)
+          continue
+        }
 
-        const isDup = await isDuplicate(fingerprint, 'shop_initial_products')
-        if (isDup) continue
+        newItems.push({ item, quality })
+      }
 
-        // Pricing
-        const priceUSD    = parseFloat(item.price?.value || '0')
-        const priceSAR    = Math.round(priceUSD * USD_TO_SAR)
-        const sellingData = applyMarkup(priceSAR)
-        if (!sellingData) continue
+      // 5. Price and save each new item
+      for (const { item, quality } of newItems) {
+        const priceUSD  = parseFloat(item.price?.value || '0')
+        const priceSAR  = Math.round(priceUSD * USD_TO_SAR)
 
-        // Main image
+        // calculatePrice takes (sourcePrice, currency) — pass SAR price directly
+        const pricing   = calculatePrice(priceSAR, 'SAR')
+        if (!pricing?.isViable) {
+          console.log(`[Worker] Not viable: ${item.title?.substring(0,40)}`)
+          rejected++
+          continue
+        }
+
         const mainImage = (item.image?.imageUrl || item.thumbnailImages?.[0]?.imageUrl || '')
           .replace(/\/s-l\d+\./, '/s-l500.')
 
-        // Extract any aspects from summary
-        const aspects = item.localizedAspects || []
+        const aspects   = item.localizedAspects || []
         const getAspect = (key) => {
           const found = aspects.find(a => a.name?.toLowerCase().includes(key))
           return Array.isArray(found?.value) ? found.value.join(', ') : (found?.value || null)
@@ -291,12 +285,10 @@ export default async function handler(req, res) {
           id:                    productId,
           name:                  item.title,
           image:                 mainImage,
-          additionalImages:      (item.additionalImages || [])
-            .map(img => img.imageUrl?.replace(/\/s-l\d+\./, '/s-l500.'))
-            .filter(Boolean)
-            .slice(0, 7),
-          sellingPriceSAR:       sellingData.sellingPriceSAR,
-          sellingPriceFormatted: sellingData.formatted,
+          additionalImages:      (item.additionalImages||[])
+            .map(img => img.imageUrl?.replace(/\/s-l\d+\./,'/s-l500.')).filter(Boolean).slice(0,7),
+          sellingPriceSAR:       pricing.sellingPriceSAR,
+          sellingPriceFormatted: pricing.sellingPriceFormatted,
           _sourcePriceSAR:       priceSAR,
           _sourceLink:           item.itemWebUrl || '',
           category:              task.firestoreCategory,
@@ -308,45 +300,60 @@ export default async function handler(req, res) {
           size:                  getAspect('size'),
           qualityScore:          quality.score || 60,
           jobId,
-          // Pricing object for webhook compatibility
+          // Pricing object (webhook needs this structure)
           pricing: {
-            sellingPriceSAR:       sellingData.sellingPriceSAR,
-            sellingPriceFormatted: sellingData.formatted,
+            sellingPriceSAR:       pricing.sellingPriceSAR,
+            sellingPriceFormatted: pricing.sellingPriceFormatted,
             sourcePriceSAR:        priceSAR,
+            profitSAR:             pricing.profitSAR,
+            isViable:              true,
           },
-          // Source fields for webhook
-          sourceLink:    item.itemWebUrl || '',
-          sourceName:    'eBay',
-          sourceId:      'ebay',
-          searchQuery:   task.query,
-          decision:      'pending',
-          createdAt:     new Date().toISOString(),
-          views:         0,
-          sales:         0,
+          // Source info (webhook needs these)
+          sourceLink:  item.itemWebUrl || '',
+          sourceName:  'eBay',
+          sourceId:    'ebay',
+          searchQuery: task.query,
+          decision:    'pending',
+          createdAt:   new Date().toISOString(),
+          views:       0,
+          sales:       0,
         }
 
-        // Save to shop_search_sessions so webhook.js can find and approve it
-        // Use jobId as the sessionId — webhook parses callback_data to get this
+        // Save to shop_search_sessions so webhook.js can find it by sessionId
         await db.collection('shop_search_sessions').doc(jobId)
           .collection('products').doc(productId).set(product)
 
-        // Also save a lightweight pending record to shop_approved_products
-        // This will be updated to 'live' by webhook when owner approves
+        // Save pending record to shop_approved_products
         await db.collection('shop_approved_products').doc(productId).set({
           ...product,
           sessionId: jobId,
           status:    'pending',
         })
 
-        // Send to Telegram for approval — callback_data must match webhook.js format
-        // webhook expects: "approve_<productId>_<sessionId>" where sessionId starts with job_
+        // Save fingerprint to prevent future duplicates
+        await saveToInitialList([{
+          id:          productId,
+          name:        item.title,
+          rawPrice:    item.price?.value,
+          sourceId:    'ebay',
+          sourceName:  'eBay',
+          sourceLink:  item.itemWebUrl || '',
+          image:       mainImage,
+          category:    task.firestoreCategory,
+          fingerprint: filterNewProducts([{
+            name: item.title, rawPrice: item.price?.value, sourceId: 'ebay'
+          }], new Set())[0]?.fingerprint,
+        }])
+
+        // Send to Telegram
         await sendProductToTelegram(product, jobId)
 
         accepted++
+        console.log(`[Worker] ✅ Accepted: ${item.title?.substring(0,40)} — ${pricing.sellingPriceSAR} SAR`)
       }
 
-    } catch (searchErr) {
-      console.error(`[Worker] Query error: ${searchErr.message}`)
+    } catch (queryErr) {
+      console.error(`[Worker] Query error: ${queryErr.message}`)
       rejected++
     }
 
@@ -359,32 +366,37 @@ export default async function handler(req, res) {
     })
 
     // Update job totals
+    const newCompleted = (job.completedTasks || 0) + 1
+    const newAccepted  = (job.accepted || 0) + accepted
+    const newRejected  = (job.rejected || 0) + rejected
     await jobRef.update({
-      completedTasks: (job.completedTasks || 0) + 1,
-      accepted:       (job.accepted       || 0) + accepted,
-      rejected:       (job.rejected       || 0) + rejected,
+      completedTasks: newCompleted,
+      accepted:       newAccepted,
+      rejected:       newRejected,
       status:         'running',
     })
 
-    // Count remaining tasks
+    // Check remaining tasks
     const remainingSnap = await jobRef.collection('tasks')
       .where('status', '==', 'pending')
-      .limit(1)
-      .get()
+      .limit(1).get()
 
     const hasMore = !remainingSnap.empty
 
+    if (!hasMore) {
+      await jobRef.update({ status: 'completed', completedAt: new Date().toISOString() })
+    }
+
     return res.status(200).json({
-      done:             !hasMore,
+      done:           !hasMore,
       accepted,
       rejected,
-      completedTasks:   (job.completedTasks || 0) + 1,
-      totalTasks:       job.totalTasks,
-      currentQuery:     task.query,
-      hasMore,
+      completedTasks: newCompleted,
+      totalTasks:     job.totalTasks,
+      currentQuery:   task.query,
       message: hasMore
-        ? `Query ${(job.completedTasks||0)+1}/${job.totalTasks}: "${task.query}" — ${accepted} found`
-        : `All done! Total: ${(job.accepted||0)+accepted} products sent to Telegram.`,
+        ? `Query ${newCompleted}/${job.totalTasks}: "${task.query}" — ${accepted} found`
+        : `All done! ${newAccepted} products sent to Telegram ✅`,
     })
 
   } catch (err) {
