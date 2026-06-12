@@ -13,10 +13,80 @@
  * 6. Returns { done: false } if more tasks remain, { done: true } when complete
  */
 
-import { db }             from '../../../lib/firebaseAdmin'
-import { applyMarkup }    from '../../../lib/pricingEngine'
-import { isDuplicate }    from '../../../lib/deduplicator'
-import { sendToTelegram } from '../../../lib/telegramNotifier'
+import { db }          from '../../../lib/firebaseAdmin'
+import { applyMarkup } from '../../../lib/pricingEngine'
+import { isDuplicate } from '../../../lib/deduplicator'
+
+// Inline Telegram sender — sends one product at a time with approve/reject buttons
+// Does NOT import from telegramNotifier to avoid export name mismatch
+async function sendProductToTelegram(product, sessionId) {
+  const BOT  = process.env.TELEGRAM_BOT_TOKEN
+  const CHAT = process.env.TELEGRAM_CHAT_ID
+
+  if (!BOT || !CHAT) {
+    console.log('[Worker] Telegram credentials missing — skipping notification')
+    return
+  }
+
+  const price = product.sellingPriceSAR
+    ? `${product.sellingPriceSAR.toLocaleString('en-SA')} SAR`
+    : 'N/A'
+
+  const text = [
+    `🛒 NEW PRODUCT — ${product.category?.replace(/_/g,' ')?.toUpperCase()}`,
+    ``,
+    `📦 ${product.name}`,
+    `💰 Sell Price: ${price}`,
+    `📋 Condition: ${product.condition || 'New'}`,
+    product.brand ? `🏷️ Brand: ${product.brand}` : '',
+    product.color ? `🎨 Color: ${product.color}` : '',
+    product.size  ? `📐 Size: ${product.size}`   : '',
+    `⭐ Quality Score: ${product.qualityScore || 60}/100`,
+    ``,
+    `Tap below to Approve or Reject`,
+  ].filter(Boolean).join('\n')
+
+  // callback_data format must match webhook.js parser:
+  // "approve_<productId>_<sessionId>"
+  const keyboard = {
+    inline_keyboard: [[
+      { text: '✅ Approve → Publish', callback_data: `approve_${product.id}_${sessionId}` },
+      { text: '❌ Reject',            callback_data: `reject_${product.id}_${sessionId}`  },
+    ]]
+  }
+
+  try {
+    // Try with image first
+    if (product.image) {
+      const photoRes = await fetch(`https://api.telegram.org/bot${BOT}/sendPhoto`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          chat_id:      CHAT,
+          photo:        product.image,
+          caption:      text,
+          reply_markup: keyboard,
+        }),
+        signal: AbortSignal.timeout(6000),
+      })
+      const photoData = await photoRes.json()
+      if (photoData.ok) return
+    }
+    // Fallback to text message
+    await fetch(`https://api.telegram.org/bot${BOT}/sendMessage`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        chat_id:      CHAT,
+        text,
+        reply_markup: keyboard,
+      }),
+      signal: AbortSignal.timeout(6000),
+    })
+  } catch (e) {
+    console.log('[Worker] Telegram send failed:', e.message)
+  }
+}
 
 const EBAY_APP_ID = process.env.EBAY_APP_ID
 const EBAY_SECRET = process.env.EBAY_SECRET
@@ -237,19 +307,40 @@ export default async function handler(req, res) {
           color:                 getAspect('color') || getAspect('colour'),
           size:                  getAspect('size'),
           qualityScore:          quality.score || 60,
-          status:                'pending',
           jobId,
-          searchQuery:           task.query,
-          createdAt:             new Date().toISOString(),
-          views:                 0,
-          sales:                 0,
+          // Pricing object for webhook compatibility
+          pricing: {
+            sellingPriceSAR:       sellingData.sellingPriceSAR,
+            sellingPriceFormatted: sellingData.formatted,
+            sourcePriceSAR:        priceSAR,
+          },
+          // Source fields for webhook
+          sourceLink:    item.itemWebUrl || '',
+          sourceName:    'eBay',
+          sourceId:      'ebay',
+          searchQuery:   task.query,
+          decision:      'pending',
+          createdAt:     new Date().toISOString(),
+          views:         0,
+          sales:         0,
         }
 
-        // Save to Firestore
-        await db.collection('shop_approved_products').doc(productId).set(product)
+        // Save to shop_search_sessions so webhook.js can find and approve it
+        // Use jobId as the sessionId — webhook parses callback_data to get this
+        await db.collection('shop_search_sessions').doc(jobId)
+          .collection('products').doc(productId).set(product)
 
-        // Send to Telegram for approval
-        await sendToTelegram(product)
+        // Also save a lightweight pending record to shop_approved_products
+        // This will be updated to 'live' by webhook when owner approves
+        await db.collection('shop_approved_products').doc(productId).set({
+          ...product,
+          sessionId: jobId,
+          status:    'pending',
+        })
+
+        // Send to Telegram for approval — callback_data must match webhook.js format
+        // webhook expects: "approve_<productId>_<sessionId>" where sessionId starts with job_
+        await sendProductToTelegram(product, jobId)
 
         accepted++
       }
