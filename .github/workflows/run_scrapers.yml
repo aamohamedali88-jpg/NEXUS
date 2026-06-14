@@ -79,3 +79,63 @@ jobs:
           FIREBASE_PRIVATE_KEY_ID: ${{ secrets.FIREBASE_PRIVATE_KEY_ID }}
         run: |
           python data_pipeline/scrapers/streams.py
+
+      # ── SHOP INVENTORY SYNC ──────────────────────────────────────────────────
+      # Checks all live marketplace products against eBay every 12 hours
+      # Automatically removes products whose eBay listings have ended or sold
+      # Automatically updates prices if source price changed > 15%
+      # Results sent to Telegram @Husin_Intel_bot
+
+      - name: Trigger Shop Inventory Sync
+        env:
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+          SITE_URL: ${{ secrets.NEXT_PUBLIC_SITE_URL }}
+        run: |
+          echo "Starting shop inventory sync..."
+
+          # Step 1: Create sync job (returns jobId instantly)
+          RESPONSE=$(curl -s -X POST \
+            "${SITE_URL}/api/shop/sync-trigger" \
+            -H "Content-Type: application/json" \
+            -H "x-cron-secret: ${ADMIN_SECRET}" \
+            --max-time 15)
+
+          echo "Sync trigger response: $RESPONSE"
+
+          JOB_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('jobId',''))" 2>/dev/null)
+          TOTAL=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('totalTasks',0))" 2>/dev/null)
+
+          if [ -z "$JOB_ID" ]; then
+            echo "No jobId returned — possibly no live products yet. Skipping."
+            exit 0
+          fi
+
+          echo "Job created: $JOB_ID — $TOTAL products to check"
+
+          # Step 2: Drive the sync-worker in a loop
+          # Each call processes 1 product (~5s each)
+          # Max 200 iterations = handles up to 200 products per run
+          MAX_ITERATIONS=200
+          ITERATION=0
+          DONE="false"
+
+          while [ "$DONE" != "true" ] && [ $ITERATION -lt $MAX_ITERATIONS ]; do
+            ITERATION=$((ITERATION + 1))
+
+            WORKER_RESPONSE=$(curl -s -X POST \
+              "${SITE_URL}/api/shop/sync-worker" \
+              -H "Content-Type: application/json" \
+              -H "x-cron-secret: ${ADMIN_SECRET}" \
+              -d "{\"jobId\": \"${JOB_ID}\"}" \
+              --max-time 15)
+
+            DONE=$(echo "$WORKER_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('done',False)).lower())" 2>/dev/null)
+            MSG=$(echo "$WORKER_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('message',''))" 2>/dev/null)
+
+            echo "[$ITERATION/$TOTAL] $MSG"
+
+            # Small pause between calls
+            sleep 2
+          done
+
+          echo "Sync complete after $ITERATION iterations"
