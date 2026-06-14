@@ -49,6 +49,16 @@ export default function OwnerDashboard() {
   const [searchDone,   setSearchDone]   = useState(false)
   const [searchErr,    setSearchErr]    = useState('')
 
+  // Sync state
+  const [syncing,      setSyncing]      = useState(false)
+  const [syncJobId,    setSyncJobId]    = useState(null)
+  const [syncProgress, setSyncProgress] = useState(null)
+  const [syncLog,      setSyncLog]      = useState([])
+  const [syncDone,     setSyncDone]     = useState(false)
+  const [syncErr,      setSyncErr]      = useState('')
+  const syncWorkerRef    = useRef(null)
+  const activeSyncJobRef = useRef(null)
+
   const [stats,        setStats]        = useState(null)
   const [sessions,     setSessions]     = useState([])
   const [sessionProds, setSessionProds] = useState([])
@@ -186,6 +196,72 @@ export default function OwnerDashboard() {
       }, 3000)
     }
   }, [token])
+
+  // ── SYNC WORKER LOOP ────────────────────────────────────────────────────────
+  const runSyncWorker = useCallback(async (jid) => {
+    if (!jid) return
+    try {
+      const res  = await fetch('/api/shop/sync-worker', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'x-shop-token': token },
+        body:    JSON.stringify({ jobId: jid }),
+      })
+      const data = await res.json()
+      if (data.error) { setSyncErr(data.error); setSyncing(false); return }
+
+      setSyncProgress({
+        completed:   data.completedTasks || 0,
+        total:       data.totalTasks     || 0,
+        result:      data.result         || '',
+        productName: data.productName    || '',
+      })
+      if (data.message) setSyncLog(prev => [data.message, ...prev].slice(0, 30))
+
+      if (data.done) {
+        setSyncing(false); setSyncDone(true); setSyncProgress(null)
+        loadStats(); loadSessions()
+      } else {
+        syncWorkerRef.current = setTimeout(() => {
+          if (activeSyncJobRef.current === jid) runSyncWorker(jid)
+        }, 2000)
+      }
+    } catch (err) {
+      syncWorkerRef.current = setTimeout(() => {
+        if (activeSyncJobRef.current === jid) runSyncWorker(jid)
+      }, 4000)
+    }
+  }, [token])
+
+  async function handleSync() {
+    if (syncing) return
+    setSyncing(true); setSyncDone(false); setSyncErr(''); setSyncLog([]); setSyncProgress(null)
+    if (syncWorkerRef.current) clearTimeout(syncWorkerRef.current)
+    try {
+      const res  = await fetch('/api/shop/sync-trigger', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'x-shop-token': token },
+        body:    JSON.stringify({}),
+      })
+      const data = await res.json()
+      if (!data.success || !data.jobId) {
+        setSyncErr(data.error || 'Failed to create sync job'); setSyncing(false); return
+      }
+      setSyncJobId(data.jobId)
+      activeSyncJobRef.current = data.jobId
+      setSyncProgress({ completed: 0, total: data.totalTasks, result: '', productName: '' })
+      setSyncLog([`Sync job created — checking ${data.totalTasks} live products...`])
+      runSyncWorker(data.jobId)
+    } catch (err) {
+      setSyncErr(err.message); setSyncing(false)
+    }
+  }
+
+  function handleSyncStop() {
+    if (syncWorkerRef.current) clearTimeout(syncWorkerRef.current)
+    activeSyncJobRef.current = null
+    setSyncing(false)
+    setSyncLog(prev => ['⏹ Sync stopped.', ...prev])
+  }
 
   async function handleSearch() {
     if (searching) return
@@ -420,6 +496,124 @@ export default function OwnerDashboard() {
                 <p style={S.logTitle}>Live Search Log</p>
                 {searchLog.map((line,i)=>(
                   <p key={i} style={{...S.logLine, opacity: i===0?1:0.5-i*0.03}}>
+                    {i===0?'▶ ':' '}{line}
+                  </p>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* ── INVENTORY SYNC PANEL ── */}
+          <div style={S.panel}>
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:16,flexWrap:'wrap',gap:10}}>
+              <div>
+                <h2 style={{...S.panelTitle,margin:0}}>🔄 Inventory Sync</h2>
+                <p style={{color:'rgba(255,255,255,0.3)',fontSize:'0.72rem',margin:'4px 0 0'}}>
+                  Checks all live products against eBay — removes unavailable listings automatically
+                </p>
+              </div>
+              <div style={{display:'flex',gap:8}}>
+                {syncing && (
+                  <button style={{...S.stopBtn,padding:'8px 14px',fontSize:'0.78rem'}}
+                    onClick={handleSyncStop}>⏹ Stop</button>
+                )}
+                <button
+                  style={{
+                    ...S.launchBtn,
+                    padding:'10px 20px',
+                    fontSize:'0.82rem',
+                    width:'auto',
+                    ...(syncing ? S.launchBtnBusy : {}),
+                  }}
+                  onClick={handleSync} disabled={syncing}>
+                  {syncing
+                    ? <><span style={S.spinner}/>Syncing...</>
+                    : '🔄 Run Sync Now'
+                  }
+                </button>
+              </div>
+            </div>
+
+            {/* What sync does */}
+            {!syncing && !syncDone && (
+              <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(180px,1fr))',gap:8,marginBottom:12}}>
+                {[
+                  { icon:'🗑️', title:'Auto-Remove',  desc:'eBay listing ended or sold' },
+                  { icon:'💰', title:'Price Updates', desc:'Source price changed >15%'  },
+                  { icon:'📈', title:'Spike Guard',   desc:'Price spike >40% = remove'  },
+                  { icon:'⏰', title:'Auto Schedule', desc:'Runs every 12h via GitHub'  },
+                ].map((item,i) => (
+                  <div key={i} style={{background:'rgba(255,255,255,0.02)',border:'1px solid rgba(255,255,255,0.06)',borderRadius:9,padding:'10px 12px'}}>
+                    <span style={{fontSize:'1.1rem'}}>{item.icon}</span>
+                    <span style={{display:'block',color:'rgba(255,255,255,0.7)',fontSize:'0.78rem',fontWeight:600,margin:'4px 0 2px'}}>{item.title}</span>
+                    <span style={{color:'rgba(255,255,255,0.3)',fontSize:'0.68rem'}}>{item.desc}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Sync progress bar */}
+            {syncing && syncProgress && (
+              <div style={{background:'rgba(0,217,255,0.04)',border:'1px solid rgba(0,217,255,0.1)',borderRadius:12,padding:14,marginBottom:12}}>
+                <div style={{height:5,background:'rgba(255,255,255,0.07)',borderRadius:4,overflow:'hidden',marginBottom:8}}>
+                  <div style={{
+                    height:'100%',
+                    width:`${syncProgress.total>0 ? Math.round((syncProgress.completed/syncProgress.total)*100) : 0}%`,
+                    background:'linear-gradient(90deg,#00d9ff,#0099bb)',
+                    borderRadius:4,
+                    transition:'width 0.5s ease',
+                  }}/>
+                </div>
+                <div style={{display:'flex',justifyContent:'space-between',flexWrap:'wrap',gap:6}}>
+                  <span style={{color:'rgba(255,255,255,0.55)',fontSize:'0.78rem'}}>
+                    Product {syncProgress.completed}/{syncProgress.total}
+                  </span>
+                  <span style={{
+                    color: syncProgress.result === 'removed'       ? '#e74c3c'
+                         : syncProgress.result === 'price_updated' ? '#f39c12'
+                         : '#2ecc71',
+                    fontSize:'0.75rem',
+                    fontWeight:600,
+                  }}>
+                    {syncProgress.result === 'removed'       ? '🗑️ Removed'
+                     : syncProgress.result === 'price_updated' ? '💰 Price updated'
+                     : syncProgress.result === 'unchanged'    ? '✅ OK'
+                     : syncProgress.result === 'skipped'      ? '⏭️ Skipped'
+                     : ''}
+                  </span>
+                </div>
+                {syncProgress.productName && (
+                  <p style={{color:'rgba(255,255,255,0.3)',fontSize:'0.7rem',margin:'5px 0 0',fontStyle:'italic',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                    🔍 "{syncProgress.productName?.substring(0,55)}"
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* Done message */}
+            {syncDone && !syncing && (
+              <div style={S.msgSuccess}>
+                ✅ Sync complete! Check Telegram for removal/price update notifications.
+              </div>
+            )}
+
+            {/* Error */}
+            {syncErr && <div style={S.msgError}>❌ {syncErr}</div>}
+
+            {/* Live sync log */}
+            {syncLog.length > 0 && (
+              <div style={{...S.logBox,maxHeight:140}}>
+                <p style={S.logTitle}>Sync Log</p>
+                {syncLog.map((line,i)=>(
+                  <p key={i} style={{
+                    ...S.logLine,
+                    opacity: i===0?1:Math.max(0.2, 0.8-i*0.08),
+                    color: line.includes('REMOVED') || line.includes('removed')
+                      ? '#e74c3c'
+                      : line.includes('updated') || line.includes('UPDATE')
+                      ? '#f39c12'
+                      : 'rgba(255,255,255,0.65)',
+                  }}>
                     {i===0?'▶ ':' '}{line}
                   </p>
                 ))}
