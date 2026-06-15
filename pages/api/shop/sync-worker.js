@@ -1,54 +1,72 @@
 /**
  * HUSIN ESHOP — POST /api/shop/sync-worker
- * FREE PLAN COMPATIBLE — checks ONE product per call, fits in 10s
+ * Phase 1 Production Hardening — Inventory Sync Executor
  *
- * REMOVAL TRIGGERS (product immediately set to status:'removed'):
- *   - eBay listing returns 404 or 410 (ended/deleted)
- *   - eBay listing has no buying options (sold/ended)
- *   - eBay listing condition changed to Used/Refurbished
- *   - eBay price spiked > 40% (listing replaced with different item)
- *   - New price no longer profitable after change
+ * Processes ONE product per call — free-plan Vercel compatible (<10s)
+ * EBAY_APP_ID and EBAY_SECRET read from process.env — no GitHub Actions injection needed
  *
- * PRICE UPDATE TRIGGERS:
- *   - Source price changed 15-40% → recalculate markup, update Firestore
+ * Removal triggers (immediate status:'removed' with no manual confirmation):
+ *   - eBay responds 404 or 410
+ *   - buyingOptions array is empty or absent
+ *   - conditionId in [2000, 3000, 7000] (used/refurb/parts)
+ *   - condition string contains 'used', 'refurb', 'pre-owned'
+ *   - price returns 0 or invalid
+ *   - price spike > 40% (listing likely replaced with different item)
+ *   - new price not viable (profitSAR < 1 from pricingEngine)
  *
- * UNCHANGED:
- *   - Listing active, price stable → update lastSyncedAt only
+ * Price update trigger: source price drift 15–40%
+ * Unchanged: drift < 15% → only lastSyncedAt updated
+ *
+ * Returns { done: true } when no pending tasks remain for this jobId
  */
 
-import { db }             from '../../../lib/firebaseAdmin'
+import { db }            from '../../../lib/firebaseAdmin'
 import { calculatePrice } from '../../../lib/pricingEngine'
 
-const EBAY_APP_ID            = process.env.EBAY_APP_ID
-const EBAY_SECRET            = process.env.EBAY_SECRET
-const BOT                    = process.env.TELEGRAM_BOT_TOKEN
-const CHAT                   = process.env.TELEGRAM_CHAT_ID
-const PRICE_UPDATE_THRESHOLD = 0.15  // 15% → update price
-const PRICE_SPIKE_THRESHOLD  = 0.40  // 40% → remove product
+// ── Constants ─────────────────────────────────────────────────────────────────
 const USD_TO_SAR             = 3.75
+const PRICE_UPDATE_THRESHOLD = 0.15   // 15% drift  → recalculate markup
+const PRICE_SPIKE_THRESHOLD  = 0.40   // 40% spike  → remove product
 
-// ── eBay OAuth ────────────────────────────────────────────────────────────────
+// ── eBay OAuth — reads credentials from process.env directly ─────────────────
 async function getEbayToken() {
-  const creds = Buffer.from(`${EBAY_APP_ID}:${EBAY_SECRET}`).toString('base64')
+  const appId  = process.env.EBAY_APP_ID
+  const secret = process.env.EBAY_SECRET
+
+  if (!appId || !secret)
+    throw new Error('EBAY_APP_ID or EBAY_SECRET env vars not set on Vercel')
+
+  const creds = Buffer.from(`${appId}:${secret}`).toString('base64')
   const res   = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
     method:  'POST',
-    headers: { 'Authorization': `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    headers: {
+      'Authorization': `Basic ${creds}`,
+      'Content-Type':  'application/x-www-form-urlencoded',
+    },
     body:    'grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope',
     signal:  AbortSignal.timeout(7000),
   })
+
   const data = await res.json()
-  if (!data.access_token) throw new Error('eBay auth failed')
+  if (!data.access_token)
+    throw new Error(`eBay OAuth failed: ${data.error_description || JSON.stringify(data)}`)
+
   return data.access_token
 }
 
-// ── Extract eBay item ID ──────────────────────────────────────────────────────
+// ── Extract eBay item ID from source URL ──────────────────────────────────────
 function extractEbayItemId(url) {
   if (!url) return null
-  const m = url.match(/\/itm\/(?:[^/?]+\/)?(\d{10,13})/)
-  return m ? m[1] : null
+  // Handles /itm/123456789 and /itm/Item-Title/123456789
+  const match = url.match(/\/itm\/(?:[^/?#]+\/)?(\d{10,13})/)
+  return match ? match[1] : null
 }
 
-// ── Check eBay listing status ─────────────────────────────────────────────────
+// ── Check single eBay listing ─────────────────────────────────────────────────
+// Returns:
+//   { available: true,  priceUSD: number, condition: string }
+//   { available: false, reason: string }
+//   { available: null,  reason: string }  ← network error, skip this cycle
 async function checkEbayListing(token, itemId) {
   try {
     const res = await fetch(
@@ -57,62 +75,81 @@ async function checkEbayListing(token, itemId) {
         headers: {
           'Authorization':           `Bearer ${token}`,
           'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+          'Content-Type':            'application/json',
         },
         signal: AbortSignal.timeout(7000),
       }
     )
 
+    // Definitive unavailability
     if (res.status === 404 || res.status === 410)
-      return { available: false, reason: `eBay listing ended (HTTP ${res.status})` }
+      return { available: false, reason: `eBay listing ended — HTTP ${res.status}` }
 
+    // Other server errors — skip, do not remove (could be temporary)
     if (!res.ok)
-      return { available: null, reason: `eBay API error ${res.status} — will retry next cycle` }
+      return { available: null, reason: `eBay API error ${res.status} — will retry next sync cycle` }
 
     const data = await res.json()
 
-    // No buying options = listing ended
+    // No buying options = listing ended or sold out
     if (!data.buyingOptions || data.buyingOptions.length === 0)
       return { available: false, reason: 'eBay listing has no buying options — ended or sold' }
 
-    // Condition flipped to Used
-    const conditionId = String(data.conditionId || '')
-    const condition   = (data.condition || '').toLowerCase()
-    if (['3000','2000','7000'].includes(conditionId) ||
-        condition.includes('used') || condition.includes('refurb') || condition.includes('pre-owned'))
-      return { available: false, reason: `Condition changed to: ${data.condition}` }
+    // Condition degraded to used/refurbished
+    const conditionId  = String(data.conditionId || '')
+    const conditionStr = (data.condition || '').toLowerCase()
+    const isUsed = (
+      ['2000', '3000', '7000'].includes(conditionId) ||
+      conditionStr.includes('used')      ||
+      conditionStr.includes('refurb')    ||
+      conditionStr.includes('pre-owned') ||
+      conditionStr.includes('for parts')
+    )
+    if (isUsed)
+      return { available: false, reason: `Condition changed to: "${data.condition}"` }
 
+    // Invalid price
     const priceUSD = parseFloat(data.price?.value || '0')
     if (!priceUSD || priceUSD <= 0)
-      return { available: false, reason: 'No valid price on eBay listing' }
+      return { available: false, reason: 'No valid price returned by eBay' }
 
-    return { available: true, priceUSD, condition: data.condition, title: data.title }
+    return {
+      available:  true,
+      priceUSD,
+      condition:  data.condition || 'New',
+      title:      data.title || '',
+    }
 
   } catch (err) {
-    return { available: null, reason: `Network error — skipping: ${err.message}` }
+    // Network error or timeout — do NOT remove product, skip this cycle
+    return { available: null, reason: `Network error (will retry next cycle): ${err.message}` }
   }
 }
 
-// ── Remove product from shop ──────────────────────────────────────────────────
+// ── Immediately remove product from marketplace ───────────────────────────────
 async function removeProduct(productId, reason) {
   await db.collection('shop_approved_products').doc(productId).update({
     status:        'removed',
     removedAt:     new Date().toISOString(),
     removedReason: reason,
+    lastSyncedAt:  new Date().toISOString(),
+    lastSyncResult:'removed',
   })
-  console.log(`[SyncWorker] REMOVED ${productId}: ${reason}`)
+  console.log(`[SyncWorker] ❌ REMOVED ${productId}: ${reason}`)
 }
 
-// ── Telegram notification ─────────────────────────────────────────────────────
-async function notify(text) {
+// ── Telegram alert (non-blocking, fire-and-forget) ────────────────────────────
+function sendTelegramAlert(text) {
+  const BOT  = process.env.TELEGRAM_BOT_TOKEN
+  const CHAT = process.env.TELEGRAM_CHAT_ID
   if (!BOT || !CHAT) return
-  try {
-    await fetch(`https://api.telegram.org/bot${BOT}/sendMessage`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ chat_id: CHAT, text }),
-      signal:  AbortSignal.timeout(5000),
-    })
-  } catch (e) { /* ignore */ }
+
+  fetch(`https://api.telegram.org/bot${BOT}/sendMessage`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ chat_id: CHAT, text }),
+    signal:  AbortSignal.timeout(5000),
+  }).catch(e => console.log('[SyncWorker] Telegram alert failed:', e.message))
 }
 
 // ── Main Handler ──────────────────────────────────────────────────────────────
@@ -120,8 +157,8 @@ export default async function handler(req, res) {
   if (req.method !== 'POST')
     return res.status(405).json({ error: 'Method not allowed' })
 
-  const authToken = req.headers['x-shop-token'] || req.headers['x-cron-secret']
-  if (authToken !== process.env.ADMIN_SECRET)
+  const incomingToken = req.headers['x-shop-token'] || req.headers['x-cron-secret']
+  if (!incomingToken || incomingToken !== process.env.ADMIN_SECRET)
     return res.status(401).json({ error: 'Unauthorized' })
 
   const { jobId } = req.body
@@ -130,43 +167,81 @@ export default async function handler(req, res) {
   try {
     const jobRef = db.collection('shop_sync_jobs').doc(jobId)
     const jobDoc = await jobRef.get()
-    if (!jobDoc.exists) return res.status(404).json({ error: 'Sync job not found' })
+
+    if (!jobDoc.exists)
+      return res.status(404).json({ error: `Sync job not found: ${jobId}` })
 
     const job = jobDoc.data()
 
-    if (job.status === 'completed')
-      return res.status(200).json({ done: true, message: 'Already completed' })
-
-    // Get next pending task — sort in JS, no Firestore index needed
-    const snap   = await jobRef.collection('tasks').where('status','==','pending').get()
-    if (snap.empty) {
-      await jobRef.update({ status:'completed', completedAt: new Date().toISOString() })
+    // Already done — return immediately so GitHub Actions loop terminates
+    if (job.status === 'completed') {
       return res.status(200).json({
         done:           true,
         removedCount:   job.removedCount   || 0,
         updatedCount:   job.updatedCount   || 0,
         unchangedCount: job.unchangedCount || 0,
-        message:        `Sync complete — ${job.removedCount||0} removed, ${job.updatedCount||0} updated, ${job.unchangedCount||0} unchanged`,
+        skippedCount:   job.skippedCount   || 0,
+        failedCount:    job.failedCount    || 0,
+        message:        `Sync already completed — ${job.removedCount||0} removed, ${job.updatedCount||0} updated`,
       })
     }
 
-    const sorted  = snap.docs.sort((a,b) => (a.data().qi||0) - (b.data().qi||0))
+    // ── Atomically fetch next pending task (sort by qi in JS — no composite index) ──
+    const pendingSnap = await jobRef
+      .collection('tasks')
+      .where('status', '==', 'pending')
+      .get()
+
+    // No pending tasks — job is complete
+    if (pendingSnap.empty) {
+      const finalJob = (await jobRef.get()).data()
+      await jobRef.update({ status: 'completed', completedAt: new Date().toISOString() })
+
+      // Final summary to Telegram
+      sendTelegramAlert([
+        `✅ INVENTORY SYNC COMPLETE`,
+        ``,
+        `📦 Total checked: ${finalJob.totalTasks || job.totalTasks}`,
+        `🗑️  Removed:       ${finalJob.removedCount   || 0}`,
+        `💰 Price updated: ${finalJob.updatedCount   || 0}`,
+        `✅ Unchanged:     ${finalJob.unchangedCount || 0}`,
+        `⏭️  Skipped:       ${finalJob.skippedCount  || 0}`,
+        `❌ Errors:        ${finalJob.failedCount    || 0}`,
+        ``,
+        `🕐 ${new Date().toLocaleString('en-SA', { timeZone: 'Asia/Riyadh' })}`,
+      ].join('\n'))
+
+      return res.status(200).json({
+        done:           true,
+        removedCount:   finalJob.removedCount   || 0,
+        updatedCount:   finalJob.updatedCount   || 0,
+        unchangedCount: finalJob.unchangedCount || 0,
+        skippedCount:   finalJob.skippedCount   || 0,
+        failedCount:    finalJob.failedCount    || 0,
+        message:        `Sync complete ✅ — ${finalJob.removedCount||0} removed, ${finalJob.updatedCount||0} updated`,
+      })
+    }
+
+    // Pick task with lowest qi (FIFO order)
+    const sorted  = pendingSnap.docs.sort((a, b) => (a.data().qi || 0) - (b.data().qi || 0))
     const taskDoc = sorted[0]
     const task    = taskDoc.data()
     const taskRef = taskDoc.ref
 
-    await taskRef.update({ status:'processing', startedAt: new Date().toISOString() })
+    // Mark as processing to prevent double-processing on concurrent calls
+    await taskRef.update({ status: 'processing', startedAt: new Date().toISOString() })
 
     let result = 'unchanged'
     let detail = ''
 
     try {
+      // ── Confirm product is still live in Firestore ────────────────────────
       const productRef  = db.collection('shop_approved_products').doc(task.productId)
       const productSnap = await productRef.get()
 
       if (!productSnap.exists || productSnap.data().status !== 'live') {
         result = 'skipped'
-        detail = 'Not live — skipped'
+        detail = 'Product no longer live in Firestore'
 
       } else {
         const product    = productSnap.data()
@@ -175,138 +250,168 @@ export default async function handler(req, res) {
 
         if (!ebayItemId) {
           result = 'skipped'
-          detail = 'No eBay item ID'
+          detail = 'No eBay item ID extractable from source link'
 
         } else {
+          // ── Call eBay API ─────────────────────────────────────────────────
           const ebayToken = await getEbayToken()
           const check     = await checkEbayListing(ebayToken, ebayItemId)
 
+          // ── Network error — skip without removing ────────────────────────
           if (check.available === null) {
-            // Network issue — skip, try next cycle
             result = 'skipped'
             detail = check.reason
 
+          // ── LISTING UNAVAILABLE — REMOVE IMMEDIATELY ─────────────────────
           } else if (!check.available) {
-            // ── REMOVE FROM SHOP ──────────────────────────────────────────
             await removeProduct(task.productId, check.reason)
-            await notify([
-              `🗑️ PRODUCT REMOVED FROM SHOP`,
+
+            sendTelegramAlert([
+              `🗑️ PRODUCT AUTO-REMOVED`,
               ``,
-              `📦 ${task.productName?.substring(0,70)}`,
+              `📦 ${task.productName}`,
               `❌ ${check.reason}`,
               ``,
-              `Automatically removed from marketplace.`,
+              `Removed from marketplace automatically.`,
             ].join('\n'))
+
             result = 'removed'
             detail = check.reason
 
+          // ── LISTING ACTIVE — evaluate price drift ─────────────────────────
           } else {
-            // ── LISTING ACTIVE — check price ──────────────────────────────
-            const oldSAR   = product._sourcePriceSAR || task.sourcePriceSAR || 0
-            const newSAR   = Math.round(check.priceUSD * USD_TO_SAR)
-            const changePct = oldSAR > 0 ? Math.abs(newSAR - oldSAR) / oldSAR : 0
+            const oldSourceSAR = product._sourcePriceSAR || task.sourcePriceSAR || 0
+            const newSourceSAR = parseFloat((check.priceUSD * USD_TO_SAR).toFixed(2))
+            const changePct    = oldSourceSAR > 0
+              ? Math.abs(newSourceSAR - oldSourceSAR) / oldSourceSAR
+              : 0
 
             if (changePct > PRICE_SPIKE_THRESHOLD) {
-              // Price spiked > 40% — remove product (likely different item)
-              const reason = `Price spiked ${Math.round(changePct*100)}%: ${oldSAR}→${newSAR} SAR`
+              // ── PRICE SPIKE > 40% — likely different item on same URL ────
+              const reason = `Price spiked ${Math.round(changePct * 100)}%: ${oldSourceSAR} → ${newSourceSAR} SAR`
               await removeProduct(task.productId, reason)
-              await notify([
-                `🗑️ PRODUCT REMOVED — Price spike`,
-                `📦 ${task.productName?.substring(0,60)}`,
-                `📈 ${oldSAR} SAR → ${newSAR} SAR (+${Math.round(changePct*100)}%)`,
+
+              sendTelegramAlert([
+                `🗑️ PRODUCT REMOVED — Price spike detected`,
+                ``,
+                `📦 ${task.productName}`,
+                `📈 ${Math.round(changePct * 100)}% increase: ${oldSourceSAR} → ${newSourceSAR} SAR`,
+                `❌ Possible listing replacement — removed for safety.`,
               ].join('\n'))
+
               result = 'removed'
               detail = reason
 
             } else if (changePct > PRICE_UPDATE_THRESHOLD) {
-              // Price changed 15-40% — recalculate markup
+              // ── PRICE DRIFT 15–40% — recalculate using pricingEngine ─────
               const newPricing = calculatePrice(check.priceUSD, 'USD')
 
               if (!newPricing.isViable) {
-                const reason = `Price change — no longer viable at ${newSAR} SAR source cost`
+                // Not profitable anymore — remove product
+                const reason = `Price change → no longer viable: source ${newSourceSAR} SAR, profit ${newPricing.profitSAR} SAR`
                 await removeProduct(task.productId, reason)
-                await notify([
-                  `🗑️ PRODUCT REMOVED — Not viable`,
-                  `📦 ${task.productName?.substring(0,60)}`,
-                  `💸 Source: ${newSAR} SAR — margin too low`,
+
+                sendTelegramAlert([
+                  `🗑️ PRODUCT REMOVED — No longer profitable`,
+                  ``,
+                  `📦 ${task.productName}`,
+                  `💸 Source cost: ${newSourceSAR} SAR — ${newPricing.viabilityNote}`,
                 ].join('\n'))
+
                 result = 'removed'
                 detail = reason
 
               } else {
-                const oldSell = product.sellingPriceSAR || 0
+                // Still profitable — update selling price
+                const oldSell = product.sellingPriceSAR || task.sellingPriceSAR || 0
                 const newSell = newPricing.sellingPriceSAR
+                const dir     = newSell > oldSell ? '📈' : '📉'
+
                 await productRef.update({
                   sellingPriceSAR:       newSell,
                   sellingPriceFormatted: newPricing.sellingPriceFormatted,
-                  _sourcePriceSAR:       newSAR,
+                  _sourcePriceSAR:       newSourceSAR,
                   pricing: {
                     sellingPriceSAR:       newSell,
                     sellingPriceFormatted: newPricing.sellingPriceFormatted,
-                    sourcePriceSAR:        newSAR,
+                    sourcePriceSAR:        newSourceSAR,
                     profitSAR:             newPricing.profitSAR,
+                    profitUSD:             newPricing.profitUSD,
+                    marginPercent:         newPricing.marginPercent,
+                    isViable:              true,
                   },
                   lastSyncedAt:   new Date().toISOString(),
                   lastSyncResult: 'price_updated',
                 })
-                await notify([
-                  `${newSell > oldSell ? '📈' : '📉'} PRICE UPDATED`,
-                  `📦 ${task.productName?.substring(0,60)}`,
-                  `${oldSell.toLocaleString('en-SA')} → ${newSell.toLocaleString('en-SA')} SAR`,
+
+                sendTelegramAlert([
+                  `${dir} PRICE UPDATED — ${Math.round(changePct * 100)}% drift`,
+                  ``,
+                  `📦 ${task.productName}`,
+                  `Old: ${oldSell.toLocaleString('en-SA')} SAR → New: ${newSell.toLocaleString('en-SA')} SAR`,
+                  `Source: ${oldSourceSAR} SAR → ${newSourceSAR} SAR`,
+                  `Profit: ${newPricing.profitSAR} SAR (${newPricing.marginPercent}% margin)`,
                 ].join('\n'))
+
                 result = 'price_updated'
-                detail = `${oldSell}→${newSell} SAR`
-                console.log(`[SyncWorker] PRICE UPDATE: ${task.productName?.substring(0,30)} — ${detail}`)
+                detail = `${oldSell} → ${newSell} SAR (${Math.round(changePct * 100)}% drift)`
+                console.log(`[SyncWorker] 💰 PRICE UPDATE: ${task.productName?.substring(0, 40)} — ${detail}`)
               }
 
             } else {
-              // Unchanged — just update lastSyncedAt
+              // ── STABLE — only update sync timestamp ──────────────────────
               await productRef.update({
                 lastSyncedAt:   new Date().toISOString(),
                 lastSyncResult: 'unchanged',
               })
               result = 'unchanged'
-              detail = `Stable (${Math.round(changePct*100)}% change)`
+              detail = `Price stable (${Math.round(changePct * 100)}% drift — below 15% threshold)`
             }
           }
         }
       }
 
     } catch (taskErr) {
-      console.error(`[SyncWorker] Task error ${task.productId}: ${taskErr.message}`)
+      console.error(`[SyncWorker] Task error for ${task.productId}: ${taskErr.message}`)
       result = 'failed'
       detail = taskErr.message
     }
 
-    // Mark task done
-    await taskRef.update({ status:'done', result, detail, completedAt: new Date().toISOString() })
+    // ── Mark task complete ────────────────────────────────────────────────────
+    await taskRef.update({
+      status:      'done',
+      result,
+      detail,
+      completedAt: new Date().toISOString(),
+    })
 
-    // Update job counters
+    // ── Increment job counters ────────────────────────────────────────────────
     const newCompleted = (job.completedTasks || 0) + 1
-    const jobUpdate    = { completedTasks: newCompleted, status:'running', lastUpdatedAt: new Date().toISOString() }
-    if (result === 'removed')       jobUpdate.removedCount   = (job.removedCount   || 0) + 1
-    if (result === 'price_updated') jobUpdate.updatedCount   = (job.updatedCount   || 0) + 1
-    if (result === 'unchanged')     jobUpdate.unchangedCount = (job.unchangedCount || 0) + 1
-    if (result === 'failed')        jobUpdate.failedCount    = (job.failedCount    || 0) + 1
-    if (result === 'skipped')       jobUpdate.skippedCount   = (job.skippedCount   || 0) + 1
-    await jobRef.update(jobUpdate)
+    const counterUpdate = {
+      completedTasks: newCompleted,
+      status:         'running',
+      lastUpdatedAt:  new Date().toISOString(),
+    }
 
-    // Check remaining
-    const remSnap = await jobRef.collection('tasks').where('status','==','pending').limit(1).get()
-    const hasMore = !remSnap.empty
+    if (result === 'removed')       counterUpdate.removedCount   = (job.removedCount   || 0) + 1
+    if (result === 'price_updated') counterUpdate.updatedCount   = (job.updatedCount   || 0) + 1
+    if (result === 'unchanged')     counterUpdate.unchangedCount = (job.unchangedCount || 0) + 1
+    if (result === 'failed')        counterUpdate.failedCount    = (job.failedCount    || 0) + 1
+    if (result === 'skipped')       counterUpdate.skippedCount   = (job.skippedCount   || 0) + 1
 
+    await jobRef.update(counterUpdate)
+
+    // ── Check for remaining pending tasks (one-doc probe) ─────────────────────
+    const remainingSnap = await jobRef
+      .collection('tasks')
+      .where('status', '==', 'pending')
+      .limit(1)
+      .get()
+
+    const hasMore = !remainingSnap.empty
     if (!hasMore) {
-      const finalJob = (await jobRef.get()).data()
-      await jobRef.update({ status:'completed', completedAt: new Date().toISOString() })
-      await notify([
-        `✅ SYNC COMPLETE`,
-        `📊 ${job.totalTasks} products checked`,
-        `🗑️ Removed: ${finalJob.removedCount||0}`,
-        `💰 Price updated: ${finalJob.updatedCount||0}`,
-        `✅ Unchanged: ${finalJob.unchangedCount||0}`,
-        `⏭️ Skipped: ${finalJob.skippedCount||0}`,
-        `❌ Errors: ${finalJob.failedCount||0}`,
-      ].join('\n'))
+      // Will be finalized on next call when pendingSnap.empty is true
+      // This avoids double-writing the completion summary
     }
 
     return res.status(200).json({
@@ -316,13 +421,13 @@ export default async function handler(req, res) {
       completedTasks: newCompleted,
       totalTasks:     job.totalTasks,
       productName:    task.productName,
-      message: hasMore
-        ? `${newCompleted}/${job.totalTasks}: "${task.productName?.substring(0,30)}" — ${result}`
-        : `Sync complete ✅`,
+      message: !hasMore
+        ? `Final task done — ${task.productName?.substring(0, 35)} (${result}). Sending summary...`
+        : `${newCompleted}/${job.totalTasks}: "${task.productName?.substring(0, 35)}" — ${result}`,
     })
 
   } catch (err) {
-    console.error('[SyncWorker] Fatal:', err.message)
+    console.error('[SyncWorker] Fatal error:', err.message)
     return res.status(500).json({ error: err.message })
   }
 }
