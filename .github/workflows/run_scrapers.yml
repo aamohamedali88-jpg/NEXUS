@@ -80,46 +80,84 @@ jobs:
         run: |
           python data_pipeline/scrapers/streams.py
 
-      # ── SHOP INVENTORY SYNC ──────────────────────────────────────────────────
-      # Checks all live marketplace products against eBay every 12 hours
-      # Automatically removes products whose eBay listings have ended or sold
-      # Automatically updates prices if source price changed > 15%
-      # Results sent to Telegram @Husin_Intel_bot
+      # ── SHOP INVENTORY SYNC ─────────────────────────────────────────────────
+      # Phase 1 Production Hardening
+      #
+      # DESIGN PRINCIPLES:
+      # - NO hardcoded iteration cap — loop runs until API returns done:true
+      # - eBay credentials live in Vercel env vars — NOT passed from here
+      # - Only ADMIN_SECRET and SITE_URL needed from GitHub secrets
+      # - Each sync-worker call processes exactly 1 product in <10s
+      # - sleep 2 between iterations prevents Vercel cold-start stacking
+      # - GitHub Actions job timeout (6h default) is the only outer boundary
+      #
+      # WHAT HAPPENS:
+      # 1. sync-trigger creates a Firestore job with one task per live product
+      # 2. sync-worker loop pops tasks one by one from Firestore queue
+      # 3. Each call checks eBay listing — removes if unavailable, updates if price drifted
+      # 4. Loop exits only when sync-worker returns { "done": true }
+      # 5. Telegram summary sent automatically by sync-worker on completion
 
-      - name: Trigger Shop Inventory Sync
+      - name: Run Shop Inventory Sync
         env:
           ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
           SITE_URL: ${{ secrets.NEXT_PUBLIC_SITE_URL }}
+          # NOTE: EBAY_APP_ID and EBAY_SECRET are NOT needed here.
+          # They are Vercel environment variables read directly by sync-worker.js
+          # via process.env — GitHub Actions only triggers the secure endpoint.
         run: |
-          echo "Starting shop inventory sync..."
+          set -e
+          echo "========================================"
+          echo "  HUSIN Shop Inventory Sync — Phase 1"
+          echo "========================================"
+          echo ""
 
-          # Step 1: Create sync job (returns jobId instantly)
-          RESPONSE=$(curl -s -X POST \
+          # ── STEP 1: Create sync job ──────────────────────────────────────
+          echo "→ Creating sync job..."
+
+          TRIGGER_RESPONSE=$(curl -s -X POST \
             "${SITE_URL}/api/shop/sync-trigger" \
             -H "Content-Type: application/json" \
             -H "x-cron-secret: ${ADMIN_SECRET}" \
-            --max-time 15)
+            --connect-timeout 10 \
+            --max-time 20)
 
-          echo "Sync trigger response: $RESPONSE"
+          echo "Trigger response: $TRIGGER_RESPONSE"
 
-          JOB_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('jobId',''))" 2>/dev/null)
-          TOTAL=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('totalTasks',0))" 2>/dev/null)
+          # Parse jobId and totalTasks using Python (pre-installed on ubuntu-latest)
+          JOB_ID=$(echo "$TRIGGER_RESPONSE" | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(d.get('jobId') or '')" 2>/dev/null || echo "")
 
-          if [ -z "$JOB_ID" ]; then
-            echo "No jobId returned — possibly no live products yet. Skipping."
+          TOTAL=$(echo "$TRIGGER_RESPONSE" | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(d.get('totalTasks') or 0)" 2>/dev/null || echo "0")
+
+          TRIGGER_DONE=$(echo "$TRIGGER_RESPONSE" | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(str(d.get('done',False)).lower())" 2>/dev/null || echo "false")
+
+          # No live products — nothing to sync
+          if [ -z "$JOB_ID" ] || [ "$TRIGGER_DONE" = "true" ]; then
+            echo "No live products to sync — skipping."
             exit 0
           fi
 
-          echo "Job created: $JOB_ID — $TOTAL products to check"
+          echo ""
+          echo "✅ Job created: $JOB_ID"
+          echo "📦 Products to check: $TOTAL"
+          echo ""
 
-          # Step 2: Drive the sync-worker in a loop
-          # Each call processes 1 product (~5s each)
-          # Max 200 iterations = handles up to 200 products per run
-          MAX_ITERATIONS=200
+          # ── STEP 2: Process all tasks — loop until done:true ─────────────
+          # NO hardcoded limit. The loop runs until the API signals completion.
+          # This scales automatically to any number of live products.
+
           ITERATION=0
           DONE="false"
+          ERRORS=0
+          MAX_CONSECUTIVE_ERRORS=5  # Safety: abort if worker repeatedly fails
 
-          while [ "$DONE" != "true" ] && [ $ITERATION -lt $MAX_ITERATIONS ]; do
+          echo "→ Starting worker loop..."
+          echo ""
+
+          while [ "$DONE" != "true" ]; do
             ITERATION=$((ITERATION + 1))
 
             WORKER_RESPONSE=$(curl -s -X POST \
@@ -127,15 +165,54 @@ jobs:
               -H "Content-Type: application/json" \
               -H "x-cron-secret: ${ADMIN_SECRET}" \
               -d "{\"jobId\": \"${JOB_ID}\"}" \
-              --max-time 15)
+              --connect-timeout 10 \
+              --max-time 20 2>/dev/null || echo '{"error":"curl_failed"}')
 
-            DONE=$(echo "$WORKER_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('done',False)).lower())" 2>/dev/null)
-            MSG=$(echo "$WORKER_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('message',''))" 2>/dev/null)
+            # Parse response fields
+            DONE=$(echo "$WORKER_RESPONSE" | python3 -c \
+              "import sys,json; d=json.load(sys.stdin); print(str(d.get('done',False)).lower())" 2>/dev/null || echo "false")
 
-            echo "[$ITERATION/$TOTAL] $MSG"
+            RESULT=$(echo "$WORKER_RESPONSE" | python3 -c \
+              "import sys,json; d=json.load(sys.stdin); print(d.get('result',''))" 2>/dev/null || echo "")
 
-            # Small pause between calls
+            MSG=$(echo "$WORKER_RESPONSE" | python3 -c \
+              "import sys,json; d=json.load(sys.stdin); print(d.get('message',''))" 2>/dev/null || echo "")
+
+            ERR=$(echo "$WORKER_RESPONSE" | python3 -c \
+              "import sys,json; d=json.load(sys.stdin); print(d.get('error',''))" 2>/dev/null || echo "")
+
+            # Log each iteration with result indicator
+            if   [ "$RESULT" = "removed" ];       then ICON="🗑️ "
+            elif [ "$RESULT" = "price_updated" ];  then ICON="💰"
+            elif [ "$RESULT" = "unchanged" ];      then ICON="✅"
+            elif [ "$RESULT" = "skipped" ];        then ICON="⏭️ "
+            elif [ "$RESULT" = "failed" ];         then ICON="❌"
+            else                                        ICON="⏳"
+            fi
+
+            echo "[$ITERATION/$TOTAL] $ICON $MSG"
+
+            # Handle worker errors
+            if [ -n "$ERR" ] && [ "$ERR" != "" ] && [ "$ERR" != "None" ]; then
+              ERRORS=$((ERRORS + 1))
+              echo "  ⚠️  Worker error ($ERRORS/$MAX_CONSECUTIVE_ERRORS): $ERR"
+
+              if [ $ERRORS -ge $MAX_CONSECUTIVE_ERRORS ]; then
+                echo ""
+                echo "❌ Too many consecutive errors ($MAX_CONSECUTIVE_ERRORS). Aborting sync."
+                echo "   Check Vercel logs for details: https://vercel.com/dashboard"
+                exit 1
+              fi
+            else
+              # Reset error counter on success
+              ERRORS=0
+            fi
+
+            # Respect Vercel cold-start window and rate limits
             sleep 2
           done
 
-          echo "Sync complete after $ITERATION iterations"
+          echo ""
+          echo "========================================"
+          echo "  Sync complete after $ITERATION iterations"
+          echo "========================================"
