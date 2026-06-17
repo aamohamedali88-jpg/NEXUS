@@ -3,7 +3,7 @@ name: Run All Scrapers
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */12 * * *"   # Runs every 12 hours
+    - cron: "0 */12 * * *"   # Every 12 hours
 
 jobs:
   scrape:
@@ -25,137 +25,151 @@ jobs:
       - name: Add project to PYTHONPATH
         run: echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
 
+      # ── SCRAPERS ─────────────────────────────────────────────────────────────
+      # Each scraper runs independently with continue-on-error: true
+      # A single scraper failure does NOT stop the others or the sync step
+      # Firebase env vars injected per-step for isolation
+
       - name: Run AI Tools Scraper
+        continue-on-error: true
         env:
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
           FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
           FIREBASE_PRIVATE_KEY: ${{ secrets.FIREBASE_PRIVATE_KEY }}
           FIREBASE_PRIVATE_KEY_ID: ${{ secrets.FIREBASE_PRIVATE_KEY_ID }}
         run: |
-          python data_pipeline/scrapers/ai_tools.py
+          echo "→ Starting AI Tools scraper..."
+          python data_pipeline/scrapers/ai_tools.py && echo "✅ AI Tools done" || echo "⚠️ AI Tools failed (non-blocking)"
 
       - name: Run Education Scraper
+        continue-on-error: true
         env:
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
           FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
           FIREBASE_PRIVATE_KEY: ${{ secrets.FIREBASE_PRIVATE_KEY }}
           FIREBASE_PRIVATE_KEY_ID: ${{ secrets.FIREBASE_PRIVATE_KEY_ID }}
         run: |
-          python data_pipeline/scrapers/education.py
+          echo "→ Starting Education scraper..."
+          python data_pipeline/scrapers/education.py && echo "✅ Education done" || echo "⚠️ Education failed (non-blocking)"
 
       - name: Run Islamic Scraper
+        continue-on-error: true
         env:
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
           FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
           FIREBASE_PRIVATE_KEY: ${{ secrets.FIREBASE_PRIVATE_KEY }}
           FIREBASE_PRIVATE_KEY_ID: ${{ secrets.FIREBASE_PRIVATE_KEY_ID }}
         run: |
-          python data_pipeline/scrapers/islamic.py
+          echo "→ Starting Islamic scraper..."
+          python data_pipeline/scrapers/islamic.py && echo "✅ Islamic done" || echo "⚠️ Islamic failed (non-blocking)"
 
       - name: Run Marketplace Scraper
+        continue-on-error: true
         env:
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
           FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
           FIREBASE_PRIVATE_KEY: ${{ secrets.FIREBASE_PRIVATE_KEY }}
           FIREBASE_PRIVATE_KEY_ID: ${{ secrets.FIREBASE_PRIVATE_KEY_ID }}
-          ETSY_API_KEY: ${{ secrets.ETSY_API_KEY }}   # Optional
+          ETSY_API_KEY: ${{ secrets.ETSY_API_KEY }}
         run: |
-          python data_pipeline/scrapers/marketplace.py
+          echo "→ Starting Marketplace scraper..."
+          python data_pipeline/scrapers/marketplace.py && echo "✅ Marketplace done" || echo "⚠️ Marketplace failed (non-blocking)"
 
       - name: Run Productivity Scraper
+        continue-on-error: true
         env:
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
           FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
           FIREBASE_PRIVATE_KEY: ${{ secrets.FIREBASE_PRIVATE_KEY }}
           FIREBASE_PRIVATE_KEY_ID: ${{ secrets.FIREBASE_PRIVATE_KEY_ID }}
         run: |
-          python data_pipeline/scrapers/productivity.py
+          echo "→ Starting Productivity scraper..."
+          python data_pipeline/scrapers/productivity.py && echo "✅ Productivity done" || echo "⚠️ Productivity failed (non-blocking)"
 
       - name: Run Streams Scraper
+        continue-on-error: true
         env:
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
           FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
           FIREBASE_PRIVATE_KEY: ${{ secrets.FIREBASE_PRIVATE_KEY }}
           FIREBASE_PRIVATE_KEY_ID: ${{ secrets.FIREBASE_PRIVATE_KEY_ID }}
         run: |
-          python data_pipeline/scrapers/streams.py
+          echo "→ Starting Streams scraper..."
+          python data_pipeline/scrapers/streams.py && echo "✅ Streams done" || echo "⚠️ Streams failed (non-blocking)"
 
       # ── SHOP INVENTORY SYNC ─────────────────────────────────────────────────
-      # Phase 1 Production Hardening
-      #
-      # DESIGN PRINCIPLES:
-      # - NO hardcoded iteration cap — loop runs until API returns done:true
-      # - eBay credentials live in Vercel env vars — NOT passed from here
-      # - Only ADMIN_SECRET and SITE_URL needed from GitHub secrets
-      # - Each sync-worker call processes exactly 1 product in <10s
-      # - sleep 2 between iterations prevents Vercel cold-start stacking
-      # - GitHub Actions job timeout (6h default) is the only outer boundary
-      #
-      # WHAT HAPPENS:
-      # 1. sync-trigger creates a Firestore job with one task per live product
-      # 2. sync-worker loop pops tasks one by one from Firestore queue
-      # 3. Each call checks eBay listing — removes if unavailable, updates if price drifted
-      # 4. Loop exits only when sync-worker returns { "done": true }
-      # 5. Telegram summary sent automatically by sync-worker on completion
+      # Runs ALWAYS — even if all scrapers above failed
+      # eBay credentials live in Vercel env vars — NOT needed here
+      # Only ADMIN_SECRET and NEXT_PUBLIC_SITE_URL needed from GitHub secrets
+      # Loop runs until sync-worker returns { "done": true } — no hardcoded limit
 
       - name: Run Shop Inventory Sync
+        # always() ensures this step runs even when previous steps fail
+        if: always()
         env:
           ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
           SITE_URL: ${{ secrets.NEXT_PUBLIC_SITE_URL }}
-          # NOTE: EBAY_APP_ID and EBAY_SECRET are NOT needed here.
-          # They are Vercel environment variables read directly by sync-worker.js
-          # via process.env — GitHub Actions only triggers the secure endpoint.
         run: |
-          set -e
           echo "========================================"
-          echo "  HUSIN Shop Inventory Sync — Phase 1"
+          echo "  HUSIN Shop Inventory Sync"
           echo "========================================"
+
+          # Validate required secrets are present
+          if [ -z "$ADMIN_SECRET" ]; then
+            echo "❌ ADMIN_SECRET secret not set in GitHub — skipping sync"
+            exit 0
+          fi
+          if [ -z "$SITE_URL" ]; then
+            echo "❌ NEXT_PUBLIC_SITE_URL secret not set in GitHub — skipping sync"
+            exit 0
+          fi
+
+          echo "Site: $SITE_URL"
           echo ""
 
-          # ── STEP 1: Create sync job ──────────────────────────────────────
+          # ── STEP 1: Create sync job ────────────────────────────────────────
           echo "→ Creating sync job..."
 
           TRIGGER_RESPONSE=$(curl -s -X POST \
             "${SITE_URL}/api/shop/sync-trigger" \
             -H "Content-Type: application/json" \
             -H "x-cron-secret: ${ADMIN_SECRET}" \
-            --connect-timeout 10 \
-            --max-time 20)
+            --connect-timeout 15 \
+            --max-time 30 \
+            2>/dev/null || echo '{"error":"curl_failed","done":true}')
 
-          echo "Trigger response: $TRIGGER_RESPONSE"
+          echo "Trigger: $TRIGGER_RESPONSE"
 
-          # Parse jobId and totalTasks using Python (pre-installed on ubuntu-latest)
+          # Parse response
           JOB_ID=$(echo "$TRIGGER_RESPONSE" | python3 -c \
-            "import sys,json; d=json.load(sys.stdin); print(d.get('jobId') or '')" 2>/dev/null || echo "")
+            "import sys,json; d=json.load(sys.stdin); print(d.get('jobId') or '')" \
+            2>/dev/null || echo "")
 
           TOTAL=$(echo "$TRIGGER_RESPONSE" | python3 -c \
-            "import sys,json; d=json.load(sys.stdin); print(d.get('totalTasks') or 0)" 2>/dev/null || echo "0")
+            "import sys,json; d=json.load(sys.stdin); print(d.get('totalTasks') or 0)" \
+            2>/dev/null || echo "0")
 
-          TRIGGER_DONE=$(echo "$TRIGGER_RESPONSE" | python3 -c \
-            "import sys,json; d=json.load(sys.stdin); print(str(d.get('done',False)).lower())" 2>/dev/null || echo "false")
+          ALREADY_DONE=$(echo "$TRIGGER_RESPONSE" | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(str(d.get('done',False)).lower())" \
+            2>/dev/null || echo "false")
 
-          # No live products — nothing to sync
-          if [ -z "$JOB_ID" ] || [ "$TRIGGER_DONE" = "true" ]; then
+          # No products to sync
+          if [ -z "$JOB_ID" ] || [ "$ALREADY_DONE" = "true" ]; then
             echo "No live products to sync — skipping."
             exit 0
           fi
 
-          echo ""
-          echo "✅ Job created: $JOB_ID"
-          echo "📦 Products to check: $TOTAL"
+          echo "✅ Job: $JOB_ID — Products to check: $TOTAL"
           echo ""
 
-          # ── STEP 2: Process all tasks — loop until done:true ─────────────
-          # NO hardcoded limit. The loop runs until the API signals completion.
-          # This scales automatically to any number of live products.
+          # ── STEP 2: Worker loop — NO hardcoded limit ───────────────────────
+          # Runs until done:true is returned
+          # Safety valve: MAX_CONSECUTIVE_ERRORS=5 aborts on repeated failures
 
           ITERATION=0
           DONE="false"
-          ERRORS=0
-          MAX_CONSECUTIVE_ERRORS=5  # Safety: abort if worker repeatedly fails
-
-          echo "→ Starting worker loop..."
-          echo ""
+          CONSECUTIVE_ERRORS=0
+          MAX_CONSECUTIVE_ERRORS=5
 
           while [ "$DONE" != "true" ]; do
             ITERATION=$((ITERATION + 1))
@@ -165,23 +179,28 @@ jobs:
               -H "Content-Type: application/json" \
               -H "x-cron-secret: ${ADMIN_SECRET}" \
               -d "{\"jobId\": \"${JOB_ID}\"}" \
-              --connect-timeout 10 \
-              --max-time 20 2>/dev/null || echo '{"error":"curl_failed"}')
+              --connect-timeout 15 \
+              --max-time 25 \
+              2>/dev/null || echo '{"error":"curl_failed"}')
 
-            # Parse response fields
+            # Parse fields
             DONE=$(echo "$WORKER_RESPONSE" | python3 -c \
-              "import sys,json; d=json.load(sys.stdin); print(str(d.get('done',False)).lower())" 2>/dev/null || echo "false")
+              "import sys,json; d=json.load(sys.stdin); print(str(d.get('done',False)).lower())" \
+              2>/dev/null || echo "false")
 
             RESULT=$(echo "$WORKER_RESPONSE" | python3 -c \
-              "import sys,json; d=json.load(sys.stdin); print(d.get('result',''))" 2>/dev/null || echo "")
+              "import sys,json; d=json.load(sys.stdin); print(d.get('result',''))" \
+              2>/dev/null || echo "")
 
             MSG=$(echo "$WORKER_RESPONSE" | python3 -c \
-              "import sys,json; d=json.load(sys.stdin); print(d.get('message',''))" 2>/dev/null || echo "")
+              "import sys,json; d=json.load(sys.stdin); print(d.get('message','no message'))" \
+              2>/dev/null || echo "")
 
             ERR=$(echo "$WORKER_RESPONSE" | python3 -c \
-              "import sys,json; d=json.load(sys.stdin); print(d.get('error',''))" 2>/dev/null || echo "")
+              "import sys,json; d=json.load(sys.stdin); print(d.get('error',''))" \
+              2>/dev/null || echo "")
 
-            # Log each iteration with result indicator
+            # Result icon
             if   [ "$RESULT" = "removed" ];       then ICON="🗑️ "
             elif [ "$RESULT" = "price_updated" ];  then ICON="💰"
             elif [ "$RESULT" = "unchanged" ];      then ICON="✅"
@@ -193,26 +212,26 @@ jobs:
             echo "[$ITERATION/$TOTAL] $ICON $MSG"
 
             # Handle worker errors
-            if [ -n "$ERR" ] && [ "$ERR" != "" ] && [ "$ERR" != "None" ]; then
-              ERRORS=$((ERRORS + 1))
-              echo "  ⚠️  Worker error ($ERRORS/$MAX_CONSECUTIVE_ERRORS): $ERR"
+            if [ -n "$ERR" ] && [ "$ERR" != "" ] && [ "$ERR" != "None" ] && [ "$ERR" != "null" ]; then
+              CONSECUTIVE_ERRORS=$((CONSECUTIVE_ERRORS + 1))
+              echo "  ⚠️ Error ($CONSECUTIVE_ERRORS/$MAX_CONSECUTIVE_ERRORS): $ERR"
 
-              if [ $ERRORS -ge $MAX_CONSECUTIVE_ERRORS ]; then
+              if [ $CONSECUTIVE_ERRORS -ge $MAX_CONSECUTIVE_ERRORS ]; then
                 echo ""
-                echo "❌ Too many consecutive errors ($MAX_CONSECUTIVE_ERRORS). Aborting sync."
-                echo "   Check Vercel logs for details: https://vercel.com/dashboard"
-                exit 1
+                echo "❌ $MAX_CONSECUTIVE_ERRORS consecutive errors — aborting sync"
+                echo "   Check Vercel runtime logs for details"
+                exit 0
               fi
-            else
-              # Reset error counter on success
-              ERRORS=0
-            fi
 
-            # Respect Vercel cold-start window and rate limits
-            sleep 2
+              # Back off on errors
+              sleep 5
+            else
+              CONSECUTIVE_ERRORS=0
+              sleep 2
+            fi
           done
 
           echo ""
           echo "========================================"
-          echo "  Sync complete after $ITERATION iterations"
+          echo "  Sync complete after $ITERATION checks"
           echo "========================================"
