@@ -589,7 +589,18 @@ function AIBundlesSection({ bundles, tokenResult, isFallback, aiResults }) {
 }
 
 // ── Server-side ───────────────────────────────────────────────────────────────
-export async function getServerSideProps() {
+// ── Server-side data — QUOTA-OPTIMIZED with ISR ────────────────────────────────
+// CHANGED: getServerSideProps → getStaticProps + revalidate
+// WHY: getServerSideProps re-reads all live products from Firestore on EVERY
+//      visitor page load. At 601 products, ~83 daily visitors exhausts the
+//      entire 50k/day Firestore Spark plan read quota from this page alone.
+// FIX: getStaticProps + revalidate:60 builds a cached static page. All visitors
+//      are served the cached version with ZERO Firestore reads. The page only
+//      re-queries Firestore when Vercel rebuilds it — at most once every 60s.
+//      New approved products appear within 60 seconds maximum.
+// Everything else on this page (AI engine, bundles, filters, cards) is
+// 100% unchanged and still works exactly as before — purely client-side.
+export async function getStaticProps() {
   try {
     const snap = await db.collection('shop_approved_products')
       .where('status','==','live').get()
@@ -608,9 +619,13 @@ export async function getServerSideProps() {
       }
     })
     products.sort((a,b) => b.approvedAt>a.approvedAt?1:-1)
-    return { props: { products, total: products.length } }
+    return {
+      props: { products, total: products.length },
+      revalidate: 60, // rebuild at most once every 60 seconds
+    }
   } catch (e) {
-    return { props: { products:[], total:0 } }
+    console.error('[Marketplace ISR]', e.message)
+    return { props: { products:[], total:0 }, revalidate: 30 }
   }
 }
 
