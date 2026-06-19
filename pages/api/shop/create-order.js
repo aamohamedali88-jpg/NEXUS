@@ -15,11 +15,15 @@
  */
 
 import { db } from '../../../lib/firebaseAdmin'
+import { USD_TO_SAR } from '../../../lib/sources.js'
+import { calculateShipping } from '../../../lib/shippingEngine.js'
 
 const PAYPAL_BASE = 'https://api-m.paypal.com'
 const CLIENT_ID   = process.env.PAYPAL_CLIENT_ID
 const SECRET      = process.env.PAYPAL_SECRET
-const USD_TO_SAR  = 3.75
+// USD_TO_SAR now imported from lib/sources.js — single source of truth (3.85)
+// Previously hardcoded here independently, which risked drifting out of sync
+// with pricingEngine.js if the rate was ever updated in only one place.
 
 async function getPayPalToken() {
   const creds = Buffer.from(`${CLIENT_ID}:${SECRET}`).toString('base64')
@@ -59,9 +63,23 @@ export default async function handler(req, res) {
     const product  = productSnap.data()
     const qty      = Math.max(1, Math.min(10, parseInt(quantity)))
     const sarPrice = product.sellingPriceSAR
-    const totalSAR = sarPrice * qty
+
+    // ── Shipping fee — single unified line item, customer never sees the
+    // internal free-shipping flat fee vs paid-shipping markup distinction.
+    // Falls back to free-shipping flat-fee model if supplier shipping data
+    // was not captured by the scraper (safe default — still profitable).
+    const shipping = calculateShipping({
+      supplierFreeShipping:    product.supplierFreeShipping !== false,
+      supplierShippingCostUSD: product.supplierShippingCostUSD || 0,
+      seed:                    productId,
+    })
+
+    const productTotalSAR = sarPrice * qty
+    const shippingFeeSAR  = shipping.customerFeeSAR
+    const totalSAR         = productTotalSAR + shippingFeeSAR
     const totalUSD = (totalSAR / USD_TO_SAR).toFixed(2)
     const unitUSD  = (sarPrice / USD_TO_SAR).toFixed(2)
+    const shippingUSD = (shippingFeeSAR / USD_TO_SAR).toFixed(2)
 
     // ── 2. Create PayPal order intent ─────────────────────────────────────────
     const ppToken   = await getPayPalToken()
@@ -80,7 +98,8 @@ export default async function handler(req, res) {
             currency_code: 'USD',
             value:         totalUSD,
             breakdown: {
-              item_total: { currency_code: 'USD', value: totalUSD }
+              item_total:     { currency_code: 'USD', value: (unitUSD * qty).toFixed(2) },
+              shipping:       { currency_code: 'USD', value: shippingUSD },
             }
           },
           items: [{
@@ -132,10 +151,20 @@ export default async function handler(req, res) {
       productCategory: product.category || 'general',
       quantity:        qty,
 
-      // Pricing
-      sellingPriceSAR: totalSAR,
-      priceUSD:        parseFloat(totalUSD),
-      unitPriceSAR:    sarPrice,
+      // Variant selected by customer (Part 3 — variant enforcement)
+      // Null-safe: products without variants simply pass null through
+      selectedVariant: req.body.selectedVariant || null,
+
+      // Pricing — product + shipping shown separately in the ledger,
+      // but customer-facing UI (checkout.js) only ever renders ONE
+      // combined "Shipping Fee" line item, never the internal split.
+      sellingPriceSAR:    productTotalSAR,
+      shippingFeeSAR,
+      shippingScenario:   shipping.scenario,         // for internal audit only
+      shippingProfitSAR:  shipping.shippingProfitSAR, // for internal audit only
+      totalChargedSAR:    totalSAR,
+      priceUSD:           parseFloat(totalUSD),       // PayPal settlement currency only
+      unitPriceSAR:        sarPrice,
 
       // Source (private — never exposed to client)
       _sourcePriceSAR: (product._sourcePriceSAR || 0) * qty,
@@ -161,6 +190,11 @@ export default async function handler(req, res) {
       paymentMethod:     'paypal',
 
       // Fulfillment (set after owner processes the order)
+      // 'not_started' → awaiting manual one-tap fulfillment by owner
+      // 'sourcing'    → owner has tapped "Fulfill" in dashboard/Telegram
+      // 'ordered'     → owner confirms eBay purchase placed
+      // 'shipped'     → tracking number attached (Part 4 polling)
+      // 'delivered'   → confirmed delivered
       fulfillmentStatus: 'not_started',
 
       // Timestamps
@@ -175,11 +209,17 @@ export default async function handler(req, res) {
     // ── 4. Return both IDs to frontend ────────────────────────────────────────
     // Frontend passes husinsOrderId to capture-order.js so it can update the
     // correct pre-existing document instead of creating a new one.
+    // NOTE: totalUSD is returned only because PayPal's JS SDK requires it
+    // internally to render the button — checkout.js must NEVER display this
+    // value to the customer (Part 1: SAR-only UI mandate).
     return res.status(200).json({
       paypalOrderId:  ppData.id,
-      husinsOrderId,           // NEW — frontend must send this to capture-order
+      husinsOrderId,
       totalSAR,
-      totalUSD:       parseFloat(totalUSD),
+      productTotalSAR,
+      shippingFeeSAR,
+      shippingFeeFormatted: shipping.customerFeeFormatted,
+      totalUSD:       parseFloat(totalUSD), // internal PayPal SDK use only
       productName:    product.name,
       qty,
     })
