@@ -503,9 +503,7 @@ function AIConsole({ onSearch, isProcessing, total }) {
               min="0" step="100" />
             <span className="ai-budget-sfx">SAR Max</span>
           </div>
-          {aiBudget && (
-            <p className="ai-budget-hint">≈ ${(parseFloat(aiBudget)/3.75).toFixed(0)} USD</p>
-          )}
+          {/* USD equivalent intentionally removed per spec Part 5 — 100% SAR-facing UI to protect currency conversion margin */}
           <button
             className={`ai-launch ${isProcessing?'ai-launch-busy':''}`}
             onClick={handleLaunch} disabled={isProcessing}>
