@@ -210,7 +210,8 @@ export default function CheckoutPage() {
   }
 
   const totalSAR = product ? (product.sellingPriceSAR * quantity).toLocaleString('en-SA', { maximumFractionDigits:0 }) + ' SAR' : ''
-  const totalUSD = product ? ((product.sellingPriceSAR * quantity) / 3.75).toFixed(2) : ''
+  // USD value computed for internal PayPal SDK use only — NEVER rendered to customer
+  const totalUSD = product ? ((product.sellingPriceSAR * quantity) / 3.85).toFixed(2) : ''
 
   // ── LOADING ───────────────────────────────────────────────────────────────
   if (loading) return (
@@ -472,7 +473,7 @@ export default function CheckoutPage() {
                   <span style={S.totalLabel}>Total</span>
                   <span style={S.totalVal}>{totalSAR}</span>
                 </div>
-                <p style={S.usdNote}>≈ ${totalUSD} USD</p>
+                {/* USD equivalent intentionally removed — SAR-only customer-facing UI (spec Part 1 & 5) */}
               </div>
 
               <div style={S.summaryTrust}>
