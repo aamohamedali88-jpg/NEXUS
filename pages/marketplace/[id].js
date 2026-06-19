@@ -160,7 +160,7 @@ export default function ProductPage({ product }) {
               <span className="pp-price-lbl">Price</span>
               <span className="pp-price">{priceStr}</span>
               {price && price > 500 && (
-                <span className="pp-price-usd">≈ ${(price/3.75).toFixed(0)} USD</span>
+                {/* USD equivalent intentionally removed — SAR-only customer-facing UI (spec Part 1 & 5) */}
               )}
             </div>
 
