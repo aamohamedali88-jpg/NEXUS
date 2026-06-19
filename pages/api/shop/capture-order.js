@@ -18,6 +18,8 @@
 
 import { db }                   from '../../../lib/firebaseAdmin'
 import { sendOrderConfirmation } from '../../../lib/emailService'
+import { USD_TO_SAR }            from '../../../lib/sources.js'
+import { calculateTotalProfit }  from '../../../lib/shippingEngine.js'
 
 const PAYPAL_BASE = 'https://api-m.paypal.com'
 const CLIENT_ID   = process.env.PAYPAL_CLIENT_ID
@@ -25,7 +27,7 @@ const SECRET      = process.env.PAYPAL_SECRET
 const BOT         = process.env.TELEGRAM_BOT_TOKEN
 const CHAT        = process.env.TELEGRAM_CHAT_ID
 const SITE        = process.env.NEXT_PUBLIC_SITE_URL || 'https://www.husin.org'
-const USD_TO_SAR  = 3.75
+// USD_TO_SAR now imported from lib/sources.js (3.85) — was hardcoded 3.75 here
 
 // ── PayPal token ──────────────────────────────────────────────────────────────
 async function getPayPalToken() {
@@ -205,22 +207,45 @@ export default async function handler(req, res) {
         ? [customerInfo.address, customerInfo.city, 'Saudi Arabia'].filter(Boolean).join(', ')
         : ''
 
-    // ── 4. Get product data for profit calculation ─────────────────────────────
-    let product    = {}
-    let profitSAR  = null
+    // ── 4. Get product + pre-registered order data for ledger ─────────────────
+    // Shipping fee/profit was already calculated and stored at create-order
+    // time (deterministic, seeded by productId) — we read it back here rather
+    // than recompute, guaranteeing the customer is never charged a shipping
+    // fee that differs between checkout display and final ledger entry.
+    let product       = {}
+    let profitSAR     = null
+    let shippingFeeSAR    = 0
+    let shippingProfitSAR = 0
+    let netProfitSAR      = null
+
+    const preRegistered = existingSnap.exists ? existingSnap.data() : {}
+    shippingFeeSAR    = preRegistered.shippingFeeSAR    || 0
+    shippingProfitSAR = preRegistered.shippingProfitSAR || 0
+
     try {
       const productSnap = await db.collection('shop_approved_products').doc(productId).get()
       if (productSnap.exists) {
         product = productSnap.data()
         const sourceCost = (product._sourcePriceSAR || 0) * parseInt(quantity)
-        if (sourceCost > 0) profitSAR = parseFloat((capturedSAR - sourceCost).toFixed(2))
+        const productRevenue = capturedSAR - shippingFeeSAR // strip shipping fee before product margin calc
+        if (sourceCost > 0) {
+          profitSAR  = parseFloat((productRevenue - sourceCost).toFixed(2))
+          netProfitSAR = calculateTotalProfit({
+            productProfitSAR:  profitSAR,
+            shippingProfitSAR,
+          })
+        }
       }
     } catch (pErr) {
       console.warn('[CaptureOrder] Could not fetch product:', pErr.message)
     }
 
-    // ── 5. BUILD FINAL ORDER PAYLOAD ──────────────────────────────────────────
-    const now          = new Date().toISOString()
+    // ── 5. BUILD FINAL ORDER PAYLOAD — Part 2 Database Ledger ─────────────────
+    const now              = new Date().toISOString()
+    const fulfillmentCostSAR = product._sourcePriceSAR
+      ? parseFloat((product._sourcePriceSAR * parseInt(quantity)).toFixed(2))
+      : null
+
     const finalPayload = {
       // Payment confirmed
       paymentStatus:   'paid',
@@ -238,10 +263,16 @@ export default async function handler(req, res) {
       capturedUSD,
       capturedSAR,
 
-      // Profit (private)
-      profitSAR,
+      // ── Part 2 Ledger — exact fields required by spec ──────────────────────
+      // "exact amount paid, purchased items, direct source eBay links,
+      //  shipping addresses, and a dynamically calculated Net Profit field"
+      fulfillmentCostSAR,     // what WE pay the supplier (eBay)
+      shippingFeeSAR,         // what customer was charged for shipping
+      shippingProfitSAR,      // hidden margin captured from shipping
+      productProfitSAR: profitSAR,    // hidden margin captured from product markup
+      netProfitSAR,            // productProfitSAR + shippingProfitSAR — the true bottom line
 
-      // Fulfillment
+      // Fulfillment — one-tap manual workflow (NOT automated eBay purchase)
       fulfillmentStatus: 'pending',
 
       // Private source fields (already on pre-registered doc, ensure updated)
@@ -296,14 +327,26 @@ export default async function handler(req, res) {
       console.error('[CaptureOrder] Email exception:', e.message)
     })
 
-    // ── 9. NOTIFY OWNER ON TELEGRAM ───────────────────────────────────────────
+    // ── 9. NOTIFY OWNER ON TELEGRAM — Part 2 exact format ─────────────────────
+    // Spec example: "A purchase of 1500 SAR was made for [Item A, Item B].
+    //                Fulfillment cost is 1200 SAR. Net profit is 300 SAR.
+    //                Order processing initiated."
+    const itemsLabel = orderForEmail.productName
+
     const ownerMsg = [
-      `🛒 NEW ORDER — HUSIN MARKETPLACE`,
+      `🛒 NEW SALE — HUSIN MARKETPLACE`,
       ``,
-      `📦 ${orderForEmail.productName}`,
-      `🔢 Qty: ${quantity}`,
-      `💰 ${capturedSAR.toLocaleString('en-SA')} SAR ($${capturedUSD} USD)`,
-      profitSAR ? `💵 Profit: ~${profitSAR} SAR` : '',
+      `A purchase of ${capturedSAR.toLocaleString('en-SA')} SAR was made for [${itemsLabel}].`,
+      fulfillmentCostSAR
+        ? `Fulfillment cost is ${fulfillmentCostSAR.toLocaleString('en-SA')} SAR.`
+        : `Fulfillment cost: not available — check product source.`,
+      netProfitSAR !== null
+        ? `Net profit is ${netProfitSAR.toLocaleString('en-SA')} SAR.`
+        : '',
+      `Order processing initiated.`,
+      ``,
+      `📦 Qty: ${quantity}`,
+      `🚚 Shipping charged: ${shippingFeeSAR.toLocaleString('en-SA')} SAR (margin: ${shippingProfitSAR.toLocaleString('en-SA')} SAR)`,
       ``,
       `👤 ${customerName || 'Anonymous'}`,
       `📧 ${customerEmail || 'N/A'}`,
@@ -316,7 +359,7 @@ export default async function handler(req, res) {
       `SOURCE — buy from eBay & ship:`,
       product._sourceLink || 'Check admin orders',
       ``,
-      `${SITE}/shop/orders`,
+      `👉 Tap to fulfill: ${SITE}/shop/orders/${husinsOrderId}`,
     ].filter(Boolean).join('\n')
 
     await sendTelegram(ownerMsg)
