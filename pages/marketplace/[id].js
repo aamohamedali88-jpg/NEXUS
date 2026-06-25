@@ -1,9 +1,3 @@
-/**
- * HUSIN ESHOP — /marketplace/[id]
- * Product detail page — image gallery, specs, sizes, colors
- * Buy Now → /shop/checkout (branded page, not PayPal redirect)
- */
-
 import { useState, useEffect } from 'react'
 import Head       from 'next/head'
 import { db }     from '../../lib/firebaseAdmin'
@@ -50,6 +44,7 @@ export default function ProductPage({ product }) {
   const [activeImage,  setActiveImage]  = useState(product.image)
   const [allImages,    setAllImages]    = useState(product.image ? [product.image] : [])
   const [quantity,     setQuantity]     = useState(1)
+  const [selectedVariant, setSelectedVariant] = useState({ color: null, size: null })
 
   useEffect(() => {
     fetch(`/api/shop/product-details?productId=${product.id}`)
@@ -78,7 +73,13 @@ export default function ProductPage({ product }) {
   const otherAsp    = aspects.filter(a => !/color|colour|size/i.test(a.name))
 
   function goCheckout() {
-    window.location.href = `/shop/checkout?productId=${product.id}&quantity=${quantity}`
+    const params = new URLSearchParams({
+      productId: product.id,
+      quantity:  quantity,
+    })
+    if (selectedVariant.color) params.set('variantColor', selectedVariant.color)
+    if (selectedVariant.size)  params.set('variantSize', selectedVariant.size)
+    window.location.href = `/shop/checkout?${params.toString()}`
   }
 
   return (
@@ -93,7 +94,6 @@ export default function ProductPage({ product }) {
 
       <div className="pp-page">
 
-        {/* Breadcrumb */}
         <div className="pp-breadcrumb">
           <a href="/"            className="pp-bc-link">Home</a>
           <span className="pp-bc-sep">›</span>
@@ -104,7 +104,6 @@ export default function ProductPage({ product }) {
 
         <div className="pp-body">
 
-          {/* ── GALLERY ── */}
           <div className="pp-gallery">
             <div className="pp-main-img-wrap">
               {activeImage ? (
@@ -116,7 +115,6 @@ export default function ProductPage({ product }) {
               {dp.condition && <span className="pp-cond-badge">{dp.condition}</span>}
             </div>
 
-            {/* Thumbnails */}
             {allImages.length > 1 && (
               <div className="pp-thumbs">
                 {allImages.map((img, i) => (
@@ -138,10 +136,8 @@ export default function ProductPage({ product }) {
             )}
           </div>
 
-          {/* ── DETAILS ── */}
           <div className="pp-info">
 
-            {/* Brand + Category */}
             <div className="pp-meta">
               {enriched?.brand && <span className="pp-brand">{enriched.brand}</span>}
               <span className="pp-cat">{product.category?.replace(/_/g,' ')}</span>
@@ -155,40 +151,47 @@ export default function ProductPage({ product }) {
               <span className="pp-instock">✅ In Stock</span>
             </div>
 
-            {/* Price */}
             <div className="pp-price-box">
               <span className="pp-price-lbl">Price</span>
               <span className="pp-price">{priceStr}</span>
-              {price && price > 500 && (
-                {/* USD equivalent intentionally removed — SAR-only customer-facing UI (spec Part 1 & 5) */}
-              )}
             </div>
 
-            {/* Colors */}
             {colorAsp.length > 0 && (
               <div className="pp-opt-group">
-                <span className="pp-opt-lbl">🎨 Color</span>
+                <span className="pp-opt-lbl">🎨 Color {selectedVariant.color ? `— ${selectedVariant.color}` : ''}</span>
                 <div className="pp-opt-chips">
-                  {colorAsp.map((a,i) => (
-                    <span key={i} className="pp-chip pp-chip-sel">{a.value}</span>
-                  ))}
+                  {colorAsp.map((a,i) => {
+                    const values = String(a.value).split(',').map(v => v.trim())
+                    return values.map((v, j) => (
+                      <button key={`${i}-${j}`}
+                        className={`pp-chip ${selectedVariant.color === v ? 'pp-chip-sel' : ''}`}
+                        onClick={() => setSelectedVariant(prev => ({ ...prev, color: v }))}>
+                        {v}
+                      </button>
+                    ))
+                  })}
                 </div>
               </div>
             )}
 
-            {/* Sizes */}
             {sizeAsp.length > 0 && (
               <div className="pp-opt-group">
-                <span className="pp-opt-lbl">📐 Size</span>
+                <span className="pp-opt-lbl">📐 Size {selectedVariant.size ? `— ${selectedVariant.size}` : ''}</span>
                 <div className="pp-opt-chips">
-                  {sizeAsp.map((a,i) => (
-                    <span key={i} className="pp-chip">{a.value}</span>
-                  ))}
+                  {sizeAsp.map((a,i) => {
+                    const values = String(a.value).split(',').map(v => v.trim())
+                    return values.map((v, j) => (
+                      <button key={`${i}-${j}`}
+                        className={`pp-chip ${selectedVariant.size === v ? 'pp-chip-sel' : ''}`}
+                        onClick={() => setSelectedVariant(prev => ({ ...prev, size: v }))}>
+                        {v}
+                      </button>
+                    ))
+                  })}
                 </div>
               </div>
             )}
 
-            {/* Quantity */}
             <div className="pp-qty-group">
               <span className="pp-opt-lbl">🔢 Quantity</span>
               <div className="pp-qty-row">
@@ -201,28 +204,10 @@ export default function ProductPage({ product }) {
               </div>
             </div>
 
-            {/* Payment options preview */}
-            <div className="pp-pay-preview">
-              <span className="pp-pay-lbl">Accepted Payments</span>
-              <div className="pp-pay-badges">
-                <span className="ppb ppb-visa">VISA</span>
-                <span className="ppb ppb-mc">MC</span>
-                <span className="ppb ppb-mada">mada</span>
-                <span className="ppb ppb-apple"> Pay</span>
-                <span className="ppb ppb-paypal">PayPal</span>
-                <span className="ppb ppb-amex">Amex</span>
-              </div>
-              <p className="pp-pay-note">
-                Pay with any card — Visa, Mastercard, Mada, or Apple Pay. No PayPal account needed.
-              </p>
-            </div>
-
-            {/* Buy button → branded checkout */}
             <button className="pp-buy-btn" onClick={goCheckout}>
               🛒 Buy Now — {totalStr || priceStr}
             </button>
 
-            {/* Trust row */}
             <div className="pp-trust">
               {[
                 {icon:'🔒',text:'SSL Secured'},
@@ -238,8 +223,7 @@ export default function ProductPage({ product }) {
           </div>
         </div>
 
-        {/* ── SPECS TABLE ── */}
-        {(otherAsp.length > 0 || colorAsp.length > 0 || sizeAsp.length > 0 || product.specifications) && (
+        {(otherAsp.length > 0 || product.specifications) && (
           <div className="pp-specs-wrap">
             <div className="pp-specs-inner">
               <h2 className="pp-specs-title">Product Specifications</h2>
@@ -249,7 +233,7 @@ export default function ProductPage({ product }) {
                 )}
                 <span className="pp-sk">Category</span>
                 <span className="pp-sv" style={{textTransform:'capitalize'}}>{product.category?.replace(/_/g,' ')}</span>
-                {[...colorAsp,...sizeAsp,...otherAsp].map((a,i)=>(
+                {otherAsp.map((a,i)=>(
                   <><span key={`k${i}`} className="pp-sk">{a.name}</span>
                   <span key={`v${i}`} className="pp-sv">{a.value}</span></>
                 ))}
@@ -257,17 +241,6 @@ export default function ProductPage({ product }) {
                   <><span className="pp-sk">Details</span><span className="pp-sv">{product.specifications}</span></>
                 )}
               </div>
-            </div>
-          </div>
-        )}
-
-        {/* ── DESCRIPTION ── */}
-        {enriched?.description && (
-          <div className="pp-desc-wrap">
-            <div className="pp-desc-inner">
-              <h2 className="pp-desc-title">Product Description</h2>
-              <div className="pp-desc-body"
-                dangerouslySetInnerHTML={{__html: enriched.description}} />
             </div>
           </div>
         )}
@@ -284,21 +257,13 @@ export default function ProductPage({ product }) {
           0%   { background-position:-800px 0; }
           100% { background-position:800px 0; }
         }
-        .shimmer {
-          background:linear-gradient(90deg,rgba(255,255,255,0.04) 0%,rgba(255,255,255,0.10) 40%,rgba(255,255,255,0.04) 80%);
-          background-size:800px 100%;
-          animation:shimmer 1.6s ease-in-out infinite;
-        }
-        .pp-page  { background:#050608; min-height:100vh; padding-bottom:60px; color:#f4f5f7; font-family:Roboto,system-ui,sans-serif; }
+        .shimmer { background:linear-gradient(90deg,rgba(255,255,255,0.04) 0%,rgba(255,255,255,0.10) 40%,rgba(255,255,255,0.04) 80%); background-size:800px 100%; animation:shimmer 1.6s ease-in-out infinite; }
+        .pp-page { background:#050608; min-height:100vh; padding-bottom:60px; color:#f4f5f7; font-family:Roboto,system-ui,sans-serif; }
         .pp-breadcrumb { max-width:1200px; margin:0 auto; padding:20px 24px 0; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-        .pp-bc-link { color:rgba(255,255,255,0.4); font-size:0.78rem; text-decoration:none; transition:color 0.2s; }
-        .pp-bc-link:hover { color:#00d9ff; }
+        .pp-bc-link { color:rgba(255,255,255,0.4); font-size:0.78rem; text-decoration:none; }
         .pp-bc-sep  { color:rgba(255,255,255,0.2); font-size:0.78rem; }
         .pp-bc-cur  { color:rgba(255,255,255,0.65); font-size:0.78rem; }
-
         .pp-body { max-width:1200px; margin:0 auto; padding:28px 24px; display:grid; grid-template-columns:1fr 1fr; gap:48px; align-items:start; }
-
-        /* Gallery */
         .pp-gallery { display:flex; flex-direction:column; gap:12px; position:sticky; top:80px; }
         .pp-main-img-wrap { position:relative; background:#fff; border-radius:16px; overflow:hidden; aspect-ratio:1; display:flex; align-items:center; justify-content:center; border:1px solid rgba(255,255,255,0.08); }
         .pp-main-img { width:100%; height:100%; object-fit:contain; padding:16px; box-sizing:border-box; }
@@ -313,8 +278,6 @@ export default function ProductPage({ product }) {
         .pp-img-loading { display:flex; flex-direction:column; gap:6px; }
         .pp-img-bar { height:3px; border-radius:2px; width:100%; }
         .pp-img-loading span { color:rgba(255,255,255,0.3); font-size:0.72rem; }
-
-        /* Info */
         .pp-info { display:flex; flex-direction:column; gap:18px; }
         .pp-meta  { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
         .pp-brand { color:#c8a46d; font-size:0.78rem; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; }
@@ -323,70 +286,34 @@ export default function ProductPage({ product }) {
         .pp-stats { display:flex; gap:16px; flex-wrap:wrap; }
         .pp-stats span { color:rgba(255,255,255,0.4); font-size:0.78rem; }
         .pp-instock { color:#2ecc71 !important; font-weight:600; }
-
-        /* Price */
         .pp-price-box  { background:linear-gradient(135deg,rgba(200,164,109,0.07),rgba(0,217,255,0.04)); border:1px solid rgba(200,164,109,0.18); border-radius:12px; padding:18px 20px; }
         .pp-price-lbl  { display:block; color:rgba(255,255,255,0.4); font-size:0.68rem; text-transform:uppercase; letter-spacing:0.1em; margin-bottom:6px; }
         .pp-price      { display:block; color:#c8a46d; font-size:2rem; font-weight:700; line-height:1; margin-bottom:4px; }
-        .pp-price-usd  { color:rgba(255,255,255,0.3); font-size:0.72rem; }
-
-        /* Options */
         .pp-opt-group { display:flex; flex-direction:column; gap:8px; }
         .pp-opt-lbl   { color:rgba(255,255,255,0.55); font-size:0.72rem; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; }
         .pp-opt-chips { display:flex; gap:8px; flex-wrap:wrap; }
-        .pp-chip      { background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.12); color:rgba(255,255,255,0.7); padding:6px 14px; border-radius:8px; font-size:0.82rem; cursor:default; transition:all 0.15s; }
+        .pp-chip      { background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.12); color:rgba(255,255,255,0.7); padding:6px 14px; border-radius:8px; font-size:0.82rem; cursor:pointer; transition:all 0.15s; font-family:inherit; }
+        .pp-chip:hover { border-color:rgba(0,217,255,0.4); }
         .pp-chip-sel  { background:rgba(0,217,255,0.08); border-color:rgba(0,217,255,0.3); color:#00d9ff; }
-
-        /* Quantity */
         .pp-qty-group { display:flex; flex-direction:column; gap:8px; }
         .pp-qty-row   { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
-        .pp-qty-btn   { width:36px; height:36px; border-radius:8px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); color:#fff; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:all 0.15s; }
+        .pp-qty-btn   { width:36px; height:36px; border-radius:8px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); color:#fff; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center; }
         .pp-qty-btn:hover { background:rgba(255,255,255,0.1); }
         .pp-qty-num   { color:#fff; font-size:1.1rem; font-weight:700; min-width:24px; text-align:center; }
         .pp-qty-total { color:#c8a46d; font-size:0.82rem; font-weight:600; }
-
-        /* Payment preview */
-        .pp-pay-preview { background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:10px; padding:14px 16px; }
-        .pp-pay-lbl     { display:block; color:rgba(255,255,255,0.35); font-size:0.65rem; text-transform:uppercase; letter-spacing:0.1em; margin-bottom:10px; }
-        .pp-pay-badges  { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px; }
-        .ppb { display:inline-flex; align-items:center; justify-content:center; height:24px; padding:0 10px; border-radius:4px; font-size:0.68rem; font-weight:700; white-space:nowrap; }
-        .ppb-visa   { background:#1A1F71; color:#fff; font-style:italic; }
-        .ppb-mc     { background:#252525; color:#fff; }
-        .ppb-mada   { background:#00A651; color:#fff; }
-        .ppb-apple  { background:#000; color:#fff; border:1px solid rgba(255,255,255,0.2); }
-        .ppb-paypal { background:#003087; color:#fff; }
-        .ppb-amex   { background:#2E77BC; color:#fff; }
-        .pp-pay-note { color:rgba(255,255,255,0.35); font-size:0.72rem; line-height:1.6; margin:0; }
-
-        /* Buy button */
         .pp-buy-btn { display:flex; align-items:center; justify-content:center; gap:8px; width:100%; background:linear-gradient(135deg,#00d9ff,#0099bb); color:#000; border:none; border-radius:12px; padding:18px 24px; font-size:1.05rem; font-weight:700; cursor:pointer; font-family:inherit; transition:opacity 0.2s,transform 0.1s; }
         .pp-buy-btn:hover { opacity:0.88; transform:translateY(-1px); }
-
-        /* Trust */
         .pp-trust      { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
         .pp-trust-item { display:flex; align-items:center; gap:7px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.06); border-radius:8px; padding:9px 12px; color:rgba(255,255,255,0.55); font-size:0.78rem; }
-
-        /* Specs */
         .pp-specs-wrap  { max-width:1200px; margin:0 auto; padding:0 24px 32px; }
         .pp-specs-inner { background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.07); border-radius:14px; padding:24px; }
         .pp-specs-title { color:#fff; font-size:1rem; font-weight:700; margin:0 0 18px; }
         .pp-specs-table { display:grid; grid-template-columns:1fr 1fr; gap:0; }
         .pp-sk { color:rgba(255,255,255,0.45); font-size:0.82rem; font-weight:500; padding:10px 14px; border-bottom:1px solid rgba(255,255,255,0.05); background:rgba(255,255,255,0.02); }
         .pp-sv { color:rgba(255,255,255,0.8); font-size:0.82rem; padding:10px 14px; border-bottom:1px solid rgba(255,255,255,0.05); }
-
-        /* Description */
-        .pp-desc-wrap  { max-width:1200px; margin:0 auto; padding:0 24px 32px; }
-        .pp-desc-inner { background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.07); border-radius:14px; padding:24px; }
-        .pp-desc-title { color:#fff; font-size:1rem; font-weight:700; margin:0 0 16px; }
-        .pp-desc-body  { color:rgba(255,255,255,0.55); font-size:0.85rem; line-height:1.7; max-height:400px; overflow-y:auto; scrollbar-width:thin; }
-        .pp-desc-body img { max-width:100%; height:auto; border-radius:8px; }
-
-        /* Back */
         .pp-back-wrap { max-width:1200px; margin:0 auto; padding:0 24px 40px; }
-        .pp-back { display:inline-block; color:rgba(255,255,255,0.45); text-decoration:none; font-size:0.82rem; padding:9px 16px; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:8px; transition:all 0.2s; }
+        .pp-back { display:inline-block; color:rgba(255,255,255,0.45); text-decoration:none; font-size:0.82rem; padding:9px 16px; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:8px; }
         .pp-back:hover { color:#fff; background:rgba(255,255,255,0.08); }
-
-        /* Responsive */
         @media (max-width:900px) {
           .pp-body { grid-template-columns:1fr; gap:28px; padding:20px; }
           .pp-gallery { position:static; }
@@ -397,9 +324,9 @@ export default function ProductPage({ product }) {
           .pp-breadcrumb { padding:14px 16px 0; }
           .pp-price { font-size:1.6rem; }
           .pp-trust { grid-template-columns:1fr; }
-          .pp-specs-wrap,.pp-desc-wrap,.pp-back-wrap { padding-left:16px; padding-right:16px; }
+          .pp-specs-wrap, .pp-back-wrap { padding-left:16px; padding-right:16px; }
           .pp-thumbs { gap:6px; }
-          .pp-thumb  { width:56px; height:56px; }
+          .pp-thumb { width:56px; height:56px; }
         }
       `}</style>
     </>
