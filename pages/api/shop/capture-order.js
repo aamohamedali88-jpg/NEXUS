@@ -1,23 +1,11 @@
 /**
  * HUSIN ESHOP — POST /api/shop/capture-order
  * Phase 2 — Idempotent Checkout: Atomic Update Lifecycle
- *
- * CHANGE FROM PREVIOUS VERSION:
- * Before: Created a NEW Firestore document on payment success (race condition risk)
- * Now:    UPDATES the pre-existing 'pending_payment' document created by create-order.js
- *         Uses husinsOrderId passed from frontend to find the exact document
- *         Sends customer email confirmation via emailService.js
- *         Telegram notification to owner with source link
- *
- * IDEMPOTENCY GUARANTEE:
- *   - Checks if order is already 'paid' before processing (prevents double-capture)
- *   - If Firestore update fails, retries up to 3 times with exponential backoff
- *   - If all retries fail, logs to Telegram so owner can reconcile manually
- *   - PayPal capture ID stored — can be reconciled against PayPal dashboard
  */
 
 import { db }                   from '../../../lib/firebaseAdmin'
 import { sendOrderConfirmation } from '../../../lib/emailService'
+import { sendInvoiceEmail }      from '../../../lib/sendInvoiceEmail'
 import { USD_TO_SAR }            from '../../../lib/sources.js'
 import { calculateTotalProfit }  from '../../../lib/shippingEngine.js'
 
@@ -27,9 +15,7 @@ const SECRET      = process.env.PAYPAL_SECRET
 const BOT         = process.env.TELEGRAM_BOT_TOKEN
 const CHAT        = process.env.TELEGRAM_CHAT_ID
 const SITE        = process.env.NEXT_PUBLIC_SITE_URL || 'https://www.husin.org'
-// USD_TO_SAR now imported from lib/sources.js (3.85) — was hardcoded 3.75 here
 
-// ── PayPal token ──────────────────────────────────────────────────────────────
 async function getPayPalToken() {
   const creds = Buffer.from(`${CLIENT_ID}:${SECRET}`).toString('base64')
   const res   = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
@@ -46,7 +32,6 @@ async function getPayPalToken() {
   return data.access_token
 }
 
-// ── Telegram alert (fire-and-forget, never throws) ────────────────────────────
 async function sendTelegram(text) {
   if (!BOT || !CHAT) return
   try {
@@ -61,8 +46,6 @@ async function sendTelegram(text) {
   }
 }
 
-// ── Firestore update with retry + exponential backoff ────────────────────────
-// Retries up to maxRetries times. If all fail, alerts Telegram so owner knows.
 async function updateOrderWithRetry(orderId, updatePayload, context, maxRetries = 3) {
   let lastErr
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -74,13 +57,11 @@ async function updateOrderWithRetry(orderId, updatePayload, context, maxRetries 
       lastErr = err
       console.error(`[CaptureOrder] Firestore update attempt ${attempt} failed: ${err.message}`)
       if (attempt < maxRetries) {
-        // Exponential backoff: 300ms, 900ms, 2700ms
         await new Promise(r => setTimeout(r, 300 * Math.pow(3, attempt - 1)))
       }
     }
   }
 
-  // All retries exhausted — alert owner immediately so they can reconcile
   const alertMsg = [
     `🚨 CRITICAL — FIRESTORE UPDATE FAILED AFTER ${maxRetries} RETRIES`,
     ``,
@@ -103,14 +84,13 @@ async function updateOrderWithRetry(orderId, updatePayload, context, maxRetries 
   return false
 }
 
-// ── Main handler ──────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
   if (req.method !== 'POST')
     return res.status(405).json({ error: 'Method not allowed' })
 
   const {
-    paypalOrderId,   // PayPal order ID (from PayPal SDK onApprove callback)
-    husinsOrderId,   // Pre-registered Firestore order ID (from create-order.js)
+    paypalOrderId,   
+    husinsOrderId,   
     productId,
     quantity     = 1,
     customerInfo = {},
@@ -122,9 +102,6 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'husinsOrderId required — ensure create-order.js v2 is deployed' })
 
   try {
-    // ── 1. IDEMPOTENCY CHECK — prevent double-processing ──────────────────────
-    // If this endpoint is called twice (browser retry, user double-click),
-    // the second call finds status:'paid' and returns success without re-capturing.
     const existingSnap = await db.collection('shop_orders').doc(husinsOrderId).get()
 
     if (existingSnap.exists) {
@@ -139,16 +116,12 @@ export default async function handler(req, res) {
         })
       }
       if (existing.paymentStatus === 'failed') {
-        // Was previously abandoned — allow retry but log it
         console.log(`[CaptureOrder] Retrying previously failed order: ${husinsOrderId}`)
       }
     } else {
-      // Pre-registration document is missing — this should not happen in Phase 2
-      // but handle gracefully: create it now so we don't lose the order
       console.warn(`[CaptureOrder] No pre-registered doc for ${husinsOrderId} — will create on success`)
     }
 
-    // ── 2. CAPTURE PAYMENT via PayPal ─────────────────────────────────────────
     const ppToken     = await getPayPalToken()
     const captureRes  = await fetch(
       `${PAYPAL_BASE}/v2/checkout/orders/${paypalOrderId}/capture`,
@@ -164,11 +137,9 @@ export default async function handler(req, res) {
 
     const captureData = await captureRes.json()
 
-    // PayPal capture did not complete
     if (captureData.status !== 'COMPLETED') {
       console.error('[CaptureOrder] Not COMPLETED:', captureData.status, JSON.stringify(captureData))
 
-      // Mark pre-registered order as failed so owner can investigate
       await db.collection('shop_orders').doc(husinsOrderId).update({
         paymentStatus: 'failed',
         failedAt:      new Date().toISOString(),
@@ -183,7 +154,6 @@ export default async function handler(req, res) {
       })
     }
 
-    // ── 3. EXTRACT CAPTURE DETAILS ────────────────────────────────────────────
     const capture       = captureData.purchase_units?.[0]?.payments?.captures?.[0]
     const payer         = captureData.payer
     const shipping      = captureData.purchase_units?.[0]?.shipping
@@ -191,7 +161,6 @@ export default async function handler(req, res) {
     const capturedSAR   = Math.round(capturedUSD * USD_TO_SAR)
     const paypalCapId   = capture?.id
 
-    // Resolve customer details — PayPal data takes priority over form input
     const customerName  = payer
       ? `${payer.name?.given_name || ''} ${payer.name?.surname || ''}`.trim()
       : customerInfo.name || ''
@@ -207,11 +176,6 @@ export default async function handler(req, res) {
         ? [customerInfo.address, customerInfo.city, 'Saudi Arabia'].filter(Boolean).join(', ')
         : ''
 
-    // ── 4. Get product + pre-registered order data for ledger ─────────────────
-    // Shipping fee/profit was already calculated and stored at create-order
-    // time (deterministic, seeded by productId) — we read it back here rather
-    // than recompute, guaranteeing the customer is never charged a shipping
-    // fee that differs between checkout display and final ledger entry.
     let product       = {}
     let profitSAR     = null
     let shippingFeeSAR    = 0
@@ -227,7 +191,7 @@ export default async function handler(req, res) {
       if (productSnap.exists) {
         product = productSnap.data()
         const sourceCost = (product._sourcePriceSAR || 0) * parseInt(quantity)
-        const productRevenue = capturedSAR - shippingFeeSAR // strip shipping fee before product margin calc
+        const productRevenue = capturedSAR - shippingFeeSAR 
         if (sourceCost > 0) {
           profitSAR  = parseFloat((productRevenue - sourceCost).toFixed(2))
           netProfitSAR = calculateTotalProfit({
@@ -240,56 +204,36 @@ export default async function handler(req, res) {
       console.warn('[CaptureOrder] Could not fetch product:', pErr.message)
     }
 
-    // ── 5. BUILD FINAL ORDER PAYLOAD — Part 2 Database Ledger ─────────────────
     const now              = new Date().toISOString()
     const fulfillmentCostSAR = product._sourcePriceSAR
       ? parseFloat((product._sourcePriceSAR * parseInt(quantity)).toFixed(2))
       : null
 
     const finalPayload = {
-      // Payment confirmed
       paymentStatus:   'paid',
       paypalCaptureId: paypalCapId,
       paidAt:          now,
       updatedAt:       now,
-
-      // Enriched customer details from PayPal
       customerName,
       customerEmail,
       shippingAddress: shippingAddr,
       customerPhone:   customerInfo.phone || null,
-
-      // Actual captured amounts (may differ slightly from SAR price due to FX)
       capturedUSD,
       capturedSAR,
-
-      // ── Part 2 Ledger — exact fields required by spec ──────────────────────
-      // "exact amount paid, purchased items, direct source eBay links,
-      //  shipping addresses, and a dynamically calculated Net Profit field"
-      fulfillmentCostSAR,     // what WE pay the supplier (eBay)
-      shippingFeeSAR,         // what customer was charged for shipping
-      shippingProfitSAR,      // hidden margin captured from shipping
-      productProfitSAR: profitSAR,    // hidden margin captured from product markup
-      netProfitSAR,            // productProfitSAR + shippingProfitSAR — the true bottom line
-
-      // Fulfillment — one-tap manual workflow (NOT automated eBay purchase)
+      fulfillmentCostSAR,     
+      shippingFeeSAR,         
+      shippingProfitSAR,      
+      productProfitSAR: profitSAR,    
+      netProfitSAR,            
       fulfillmentStatus: 'pending',
-
-      // Private source fields (already on pre-registered doc, ensure updated)
       _sourceLink:     product._sourceLink     || null,
       _sourcePriceSAR: product._sourcePriceSAR  || null,
     }
 
-    // ── 6. ATOMIC UPDATE of pre-registered Firestore document ─────────────────
-    // This is the core Phase 2 guarantee: we UPDATE, never INSERT.
-    // The document already exists from step 3 of create-order.js.
     const context = { paypalCaptureId: paypalCapId, customerEmail, capturedSAR }
     const updated = await updateOrderWithRetry(husinsOrderId, finalPayload, context)
 
     if (!updated) {
-      // Firestore update completely failed after all retries
-      // Telegram alert was already sent inside updateOrderWithRetry
-      // Return 207 (Multi-Status) — payment succeeded but DB write failed
       return res.status(207).json({
         success:  false,
         orderId:  husinsOrderId,
@@ -298,15 +242,13 @@ export default async function handler(req, res) {
       })
     }
 
-    // ── 7. Increment product sales counter (non-blocking) ─────────────────────
     if (productId && product?.sales !== undefined) {
       db.collection('shop_approved_products').doc(productId)
         .update({ sales: (product.sales || 0) + parseInt(quantity) })
         .catch(e => console.warn('[CaptureOrder] Sales increment failed:', e.message))
     }
 
-    // ── 8. SEND CUSTOMER EMAIL CONFIRMATION ───────────────────────────────────
-    // Build the final order object for the email template
+    // ── 8. SEND CUSTOMER EMAIL CONFIRMATION & INVOICE ─────────────────────────
     const orderForEmail = {
       orderId:         husinsOrderId,
       productName:     product.name || existingSnap.data()?.productName || 'Your order',
@@ -318,19 +260,24 @@ export default async function handler(req, res) {
       paidAt:          now,
     }
 
-    // Fire email non-blocking — email failure should NOT block order confirmation
+    // Fire emails non-blocking
     sendOrderConfirmation(orderForEmail).then(result => {
-      if (!result.success) {
-        console.warn(`[CaptureOrder] Email failed for ${husinsOrderId}: ${result.reason}`)
+      if (!result?.success) {
+        console.warn(`[CaptureOrder] Confirmation email failed for ${husinsOrderId}: ${result?.reason}`)
       }
     }).catch(e => {
-      console.error('[CaptureOrder] Email exception:', e.message)
+      console.error('[CaptureOrder] Confirmation email exception:', e.message)
     })
 
-    // ── 9. NOTIFY OWNER ON TELEGRAM — Part 2 exact format ─────────────────────
-    // Spec example: "A purchase of 1500 SAR was made for [Item A, Item B].
-    //                Fulfillment cost is 1200 SAR. Net profit is 300 SAR.
-    //                Order processing initiated."
+    sendInvoiceEmail(orderForEmail).then(result => {
+      if (!result?.success) {
+        console.warn(`[CaptureOrder] Invoice email failed for ${husinsOrderId}: ${result?.reason}`)
+      }
+    }).catch(e => {
+      console.error('[CaptureOrder] Invoice email exception:', e.message)
+    })
+
+    // ── 9. NOTIFY OWNER ON TELEGRAM ───────────────────────────────────────────
     const itemsLabel = orderForEmail.productName
 
     const ownerMsg = [
@@ -373,7 +320,6 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error('[CaptureOrder] Fatal:', err.message)
 
-    // Alert Telegram on unexpected fatal error
     await sendTelegram([
       `🚨 CAPTURE-ORDER FATAL ERROR`,
       `Order: ${husinsOrderId || 'unknown'}`,
