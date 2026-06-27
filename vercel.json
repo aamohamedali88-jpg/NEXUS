@@ -3,10 +3,6 @@
     {
       "path": "/api/shop/track-shipment",
       "schedule": "0 */6 * * *"
-    },
-    {
-      "path": "/api/shop/sync-trigger",
-      "schedule": "0 */12 * * *"
     }
   ]
 }
