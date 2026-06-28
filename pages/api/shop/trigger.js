@@ -226,11 +226,20 @@ export default async function handler(req, res) {
     createdAt:    new Date().toISOString(),
   })
 
-  // Save each task as subcollection doc
+  // ── FIX (2026-06-28): tasks now written to the FLAT 'shop_search_tasks'
+  // collection that trigger-worker.js actually queries. Previously these were
+  // written to a per-job subcollection (shop_search_jobs/{jobId}/tasks) which
+  // trigger-worker.js never read from — every worker call found zero pending
+  // tasks and exited immediately, so no new eBay products were ever discovered.
+  // jobId is kept on each task doc for traceability back to the parent job.
   const batch = db.batch()
   serializedTasks.forEach((task, i) => {
-    const taskRef = jobRef.collection('tasks').doc(`task_${String(i).padStart(3,'0')}`)
-    batch.set(taskRef, task)
+    const taskRef = db.collection('shop_search_tasks').doc(`${jobId}_task_${String(i).padStart(3,'0')}`)
+    batch.set(taskRef, {
+      ...task,
+      jobId,
+      createdAt: new Date().toISOString(),
+    })
   })
   await batch.commit()
 
