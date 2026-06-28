@@ -266,7 +266,6 @@ jobs:
           echo "Site: $SITE_URL"
           echo ""
 
-          # ── STEP 1: Create discovery job (category=all) ───────────────────
           echo "→ Creating eBay search job..."
 
           TRIGGER_RESPONSE=$(curl -s -X POST \
@@ -295,11 +294,6 @@ jobs:
 
           echo "✅ Job: $JOB_ID — Search queries queued: $TOTAL"
           echo ""
-
-          # ── STEP 2: Worker loop — drains the flat task queue, not job-scoped ──
-          # trigger-worker.js pulls the oldest pending task regardless of jobId,
-          # so this loop just keeps calling it until done:true, same pattern
-          # as the inventory sync loop above.
 
           ITERATION=0
           DONE="false"
@@ -358,11 +352,9 @@ jobs:
               sleep 5
             else
               CONSECUTIVE_ERRORS=0
-              sleep 1 # anti-ban pacing is handled inside trigger-worker.js itself
+              sleep 1
             fi
 
-            # Hard safety cap — discovery should never loop forever even if
-            # something is wrong with the done:true signal
             if [ $ITERATION -ge 500 ]; then
               echo "⚠️ Hit 500-iteration safety cap — stopping early."
               break
@@ -372,4 +364,69 @@ jobs:
           echo ""
           echo "========================================"
           echo "  eBay discovery complete after $ITERATION queries"
+          echo "========================================"
+
+      # ── ABANDONED CART REMINDER ──────────────────────────────────────────────
+      # Runs after the eBay discovery job, same 12-hour cadence.
+      # Calls /api/cron/abandoned-cart, which finds shop_orders still in
+      # 'pending_payment' more than 24h after creation and sends a one-time
+      # reminder email via the sales@husin.org alias. The endpoint itself is
+      # idempotent (sets abandonedCartReminderSentAt so it never double-emails
+      # the same order), so this step just needs to fire — no worker loop.
+
+      - name: Run Abandoned Cart Reminder
+        if: always()
+        env:
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+          SITE_URL: ${{ secrets.NEXT_PUBLIC_SITE_URL }}
+        run: |
+          echo "========================================"
+          echo "  HUSIN Abandoned Cart Reminder"
+          echo "========================================"
+
+          if [ -z "$ADMIN_SECRET" ]; then
+            echo "❌ ADMIN_SECRET secret not set — skipping"
+            exit 0
+          fi
+          if [ -z "$SITE_URL" ]; then
+            echo "❌ NEXT_PUBLIC_SITE_URL secret not set — skipping"
+            exit 0
+          fi
+
+          echo "Site: $SITE_URL"
+          echo ""
+
+          RESPONSE=$(curl -s -X POST \
+            "${SITE_URL}/api/cron/abandoned-cart" \
+            -H "Content-Type: application/json" \
+            -H "x-cron-secret: ${ADMIN_SECRET}" \
+            --connect-timeout 15 \
+            --max-time 60 \
+            2>/dev/null || echo '{"error":"curl_failed"}')
+
+          echo "Response: $RESPONSE"
+
+          SENT=$(echo "$RESPONSE" | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(d.get('sent',0))" \
+            2>/dev/null || echo "0")
+
+          SKIPPED=$(echo "$RESPONSE" | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(d.get('skipped',0))" \
+            2>/dev/null || echo "0")
+
+          ERR=$(echo "$RESPONSE" | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(d.get('error',''))" \
+            2>/dev/null || echo "")
+
+          if [ -n "$ERR" ] && [ "$ERR" != "" ] && [ "$ERR" != "None" ] && [ "$ERR" != "null" ]; then
+            echo "⚠️ Error: $ERR"
+            if [ "$ERR" = "curl_failed" ]; then
+              echo "⚠️ This may indicate a missing Firestore composite index —"
+              echo "   check Vercel logs for abandoned-cart.js (FAILED_PRECONDITION)."
+            fi
+          fi
+
+          echo ""
+          echo "========================================"
+          echo "  Reminders sent: $SENT — Skipped: $SKIPPED"
           echo "========================================"
