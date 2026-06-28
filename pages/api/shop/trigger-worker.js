@@ -10,6 +10,7 @@
 import { db }              from '../../../lib/firebaseAdmin'
 import { calculatePrice }  from '../../../lib/pricingEngine'
 import { mapCategory }     from '../../../lib/categoryMapper'
+import { notifyProductForApproval } from '../../../lib/telegramNotifier'
 import { withBackoff, fixedDelay } from '../../../lib/rateLimiter'
 
 const EBAY_APP_ID    = process.env.EBAY_APP_ID
@@ -150,7 +151,13 @@ export default async function handler(req, res) {
       const existing = await db.collection('shop_approved_products').doc(fingerprint).get()
       if (existing.exists) { rejected++; continue }
 
-      await db.collection('shop_approved_products').doc(fingerprint).set({
+      // FIX (2026-06-29): was status:'live' with no Telegram notification at
+      // all — products went straight to the live store with zero owner review,
+      // and the dashboard's "sent to Telegram for approval" promise was never
+      // true for this pipeline. Now writes 'pending' + sends an approve/reject
+      // message, reusing the exact callback_data shape webhook.js already
+      // parses (see notifyProductForApproval in lib/telegramNotifier.js).
+      const newProduct = {
         id: fingerprint,
         name: detail.title,
         image: quality.images[0],
@@ -165,9 +172,17 @@ export default async function handler(req, res) {
         _sourceLink: detail.itemWebUrl || '',
         supplierFreeShipping: !detail.shippingOptions?.[0]?.shippingCost?.value,
         supplierShippingCostUSD: parseFloat(detail.shippingOptions?.[0]?.shippingCost?.value || 0),
-        status: 'live',
+        status: 'pending',
         createdAt: new Date().toISOString(),
-      })
+      }
+
+      await db.collection('shop_approved_products').doc(fingerprint).set(newProduct)
+
+      try {
+        await notifyProductForApproval(newProduct, task.jobId)
+      } catch (notifyErr) {
+        console.error('[Worker] Telegram notify failed (product still saved as pending):', notifyErr.message)
+      }
 
       accepted++
     }
